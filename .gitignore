@@ -1,0 +1,15 @@
+# 运行时数据：索引、共享记忆、派工留痕、日志，一律不进仓库
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+.last_sync
+.agentfind_down
+dispatches/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 安装产物
+*.lnk

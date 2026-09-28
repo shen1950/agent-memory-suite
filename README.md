@@ -1,0 +1,76 @@
+# agent-memory-suite
+
+两个**单文件、零第三方依赖**的 Windows 工具，解决同一件事：你和多个 AI Agent 聊过的内容，散在各自产品的私有记录里，互相看不见。
+
+| 工具 | 干什么 | 入口 |
+|---|---|---|
+| **AgentFind** | 跨 Agent 对话全文检索：把各产品的会话记录统一索引成一份本地 FTS5 库，按关键词 / 项目 / 时间 / 产物文件名反查「何时 · 哪个产品 · 哪个项目 · 哪场对话」，网页里还能一键跳回原应用的那场对话 | `agentfind`（网页）/ `agentfind 关键词` / `agentfind --cli 关键词` |
+| **AgentHub** | 跨 Agent 共享记忆 + 子 Agent 派工：一份中心 SQLite 库，各产品的原生记忆只读同步进来；任何 Agent 都能写结论、查别人的结论；也能把任务派给 `codex` / `claude` 无头执行 | `agenthub mem search "关键词"` / `agenthub mem write ...` / `agenthub call codex "任务"` |
+
+两者是闭环的：AgentHub 的检索结果末尾会附上 AgentFind 的深链，从「别的 Agent 的结论」直接跳回「那场对话的原文」。
+
+## 安装（Windows 10/11，Python ≥ 3.10）
+
+```powershell
+git clone https://github.com/shen1950/agent-memory-suite.git
+cd agent-memory-suite
+powershell -ExecutionPolicy Bypass -File install.ps1                     # 装到 ~/.agentfind 与 ~/.agenthub，并加入 PATH
+powershell -ExecutionPolicy Bypass -File install.ps1 -DesktopShortcuts   # 额外在桌面建「找 AI 对话 / 关闭找 AI 对话」双击入口
+```
+
+装完新开一个终端：
+
+```bash
+agentfind                 # 起本地网页（127.0.0.1:8765）并打开浏览器
+agentfind 锂电池          # 预填关键词
+agentfind --status        # 各产品会话数
+agentfind --rebuild       # 全量重建索引（约 30s / 700 场）
+agenthub mem search "关键词"
+agenthub mem context "查询"   # 生成可直接粘进提示词的记忆上下文块
+```
+
+桌面入口是给不想碰终端的人的：双击「找 AI 对话」即开网页，重复双击不会起第二个服务；「关闭找 AI 对话」只停服务、不删索引。
+
+## 已验证能索引的产品
+
+自动发现规则：任何把会话存成 `~/.<产品>/projects/<项目>/<会话>.jsonl` 的 Agent 都会被纳入，无需改代码。
+
+| 产品 | 记录位置 | 粒度 |
+|---|---|---|
+| Claude Code / Qoder CN / Qoder / WorkBuddy / QwenWork CN / CatPaw 等 | `~/.<产品>/projects/**/*.jsonl` | 逐条消息 |
+| Codex | `~/.codex/sessions/**/*.jsonl` | 逐条消息 |
+| opencode / ZCode | `~/.local/share/opencode/opencode.db`、`~/.zcode/cli/db/db.sqlite`（同构） | 逐条消息 |
+| TraeWork CN | `~/.trae-cn/memory/projects/**`（正文库加密，只索引它自己落盘的会话摘要） | 摘要级 |
+
+**索引不到 ≠ 没聊过**：Cursor、VS Code Copilot Chat（记录在 `workspaceStorage/*/state.vscdb`）、Qoder IDE 侧边栏、以及任何加密正文库，页面首页会如实列出来。
+
+## 跳回原对话（三档，按钮文案如实标注）
+
+| 档 | 行为 | 已实测 |
+|---|---|---|
+| `chat` | 直接打开那场会话 | WorkBuddy（`workbuddy://chat/<sessionId>`）、Codex（`codex resume <id>`） |
+| `app` | 把应用唤到前台，同时把会话 ID 复制进剪贴板 | Qoder / QwenWork / ZCode / opencode（协议只到应用级） |
+| `file` | 在资源管理器里选中原始记录文件 | 兜底，所有源都保证有反应 |
+
+## 隐私
+
+- **所有数据留在本机**：索引在 `~/.agentfind/index.sqlite`，共享记忆在 `~/.agenthub/memory.sqlite`；网页服务只绑定 `127.0.0.1`。
+- 仓库里不含任何索引、记忆、日志或派工留痕（见 `.gitignore`）。
+- 只读原则：两个工具都不改写任何产品的原始记录；AgentHub 同步原生记忆时也只读抓取、从不回写。
+- 会启动本机应用的接口（`POST /api/open`）有三道闸：自定义请求头、Origin 校验、sid 必须存在于索引；命令一律按参数列表执行，不拼 shell。
+
+## 卸载
+
+```powershell
+powershell -ExecutionPolicy Bypass -File uninstall.ps1              # 移除命令与快捷方式，保留数据
+powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveData # 连索引和记忆库一起删
+```
+
+## 文档
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) —— 索引结构、FTS5 在本机 SQLite 上的坑、片段抓取的两步法、跳转层与同步机制的设计理由。
+- [skills/agent-collab/SKILL.md](skills/agent-collab/SKILL.md) —— 给 Agent 自己读的协作规则（装到 `~/.agents/skills/` 后各产品共用）。
+
+## License
+
+MIT
