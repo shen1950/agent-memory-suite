@@ -74,3 +74,31 @@
 `--cli` / `--status` 在检测到 8765 已有服务时**改走本地 HTTP**，不再自己开库扫描。
 原因：SQLite 同一文件上两个写者会 `database is locked`；而在役服务的增量扫描本来就会做这件事，CLI 再扫一遍既是锁冲突源也是纯浪费。
 服务没在跑时才回落到本地开库的老路径。
+
+## 12. Trae slug 逆向与还原（v1.2.0）
+
+TraeWork 把会话摘要存在 `~/.trae-cn/memory/projects/<slug>/...`，slug 是真实项目路径被不可逆替换后的串
+（中文全变 `-`）。用仅有的两条 ground truth（`project_memory.md` 里的 `> 项目路径：…` + 一条 workspace.json）拟合出完整规则：
+
+- 规范化：`D:\a\b` → `/d/a/b`（反斜杠→`/`、去盘符冒号、盘符小写、去尾 `/`）
+- 主体：对 `规范化路径 + "/"` 的每个非 `[A-Za-z0-9]` 字符**逐个**换成 `-`（不合并连续）
+- slug = `主体 + -p2- + sha256(规范化路径)[:20]`；内部 work-mode 项目还会在主体后插一段随机 6 位小写串再接 `--p2-`，
+  且主体省掉 `/c/Users/` 前缀，但 **hash 始终按完整规范化路径算**
+
+还原是"正向算、hash 验"：枚举候选路径，复算 slug 比对，sha256 逐条校验 → 命中即唯一，不需要任何概率判断。
+候选来源按有效性排序：① Trae 记录的明文路径（memory 下的 md/json/jsonl）；② `state.vscdb` 页面字节里的
+`file:///` URI（**注意允许非 ASCII 字节，否则中文路径被截断**；也要允许字面 `\ufffd`，Trae 自己会把存坏的路径
+以替换符落盘）；③ work-mode-projects 目录本身；④ 兜底枚举 home 与 `D:\` ≤3 层真实目录——有 hash 校验，候选再多
+也不误伤。本机 12/12 全部还原，构建候选约 2.8s（进程内缓存一次）。
+
+## 13. VS Code Copilot 与 Cursor 的边界（v1.2.0）
+
+- Copilot 的**对话正文不在** `workspaceStorage/*/state.vscdb`（那里只有面板 memento，输入框状态恒为空）。
+  真源是 `globalStorage/github.copilot-chat/session-store.db`：`sessions(id,cwd,summary,created_at,updated_at)` +
+  `turns(session_id,turn_index,user_message,assistant_response,timestamp)`。`turns` 一行是一个来回、user/assistant 两列，
+  不是 role 字段。只读打开**不要带 `immutable=1`**：该库常年挂 `-wal`，immutable 会读不到 WAL 里的新行、误判为空表。
+  本机 Copilot 暂无历史正文，解析器按 fixture 验证（空会话跳过、时间戳 ISO、产物从正文抽路径）。
+- Cursor **故意不接**：它的 `cursorDiskKV['composerData:<id>']` 本机只有空壳（`conversation=[]`），正文存服务器端，
+  本地补 `bubbleId:` 也没有。把它留在未覆盖清单并写明原因，比接进来显示 0 条更诚实。
+- 若以后要接 Cursor：结构是 `composerData`（头）+ `bubbleId:<composerId>:<bubbleId>`（正文）两段拼，
+  索引时还要注意同一 sessionId 会在多个 workspace 目录重复出现，得去重。

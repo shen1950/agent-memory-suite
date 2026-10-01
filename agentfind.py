@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -30,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import urlopen
 
 HOME = Path.home()
@@ -256,7 +257,7 @@ SKIP_DIRS = {"node_modules", ".git", "vendor_imports", "backups_state", "skills"
 SCAN_SKIP = {".agents", ".cache", ".config", ".local", ".npm", ".cargo", ".conda", ".android"}
 
 # 本机装了但记录格式还没解析的：页面上要如实告诉用户，免得以为没聊过
-UNCOVERED = ["Cursor", "VS Code Copilot Chat", "Qoder IDE 侧边栏对话"]
+UNCOVERED = ["Cursor（正文存服务器端，本机只有空壳）", "Qoder IDE 侧边栏对话"]
 
 
 def pretty(dirname: str) -> str:
@@ -265,7 +266,7 @@ def pretty(dirname: str) -> str:
 
 
 def discover_sources():
-    """[(source_id, label, kind, [root, ...])]，kind ∈ claude_jsonl | codex_jsonl | opencode_db | trae_memory"""
+    """[(source_id, label, kind, [root, ...])]，kind ∈ claude_jsonl | codex_jsonl | opencode_db | trae_memory | copilot_db"""
     out, known = [], set()
 
     def add(sid, label, kind, roots):
@@ -296,10 +297,12 @@ def discover_sources():
     add("opencode", "opencode", "opencode_db", [HOME / ".local/share/opencode/opencode.db"])
     add("zcode", "ZCode", "opencode_db", [HOME / ".zcode/cli/db/db.sqlite"])
     add(TRAE_SOURCE, TRAE_LABEL, "trae_memory", [HOME / ".trae-cn/memory/projects"])
+    add("vscode-copilot", "VS Code Copilot", "copilot_db",
+        [HOME / "AppData/Roaming/Code/User/globalStorage/github.copilot-chat"])
     return out
 
 
-KIND_PATTERN = {"opencode_db": "*.db", "trae_memory": "*"}
+KIND_PATTERN = {"opencode_db": "*.db", "copilot_db": "session-store.db", "trae_memory": "*"}
 
 
 def iter_files(roots, pattern):
@@ -493,13 +496,172 @@ def parse_opencode_db(path: Path, sid="opencode", label="opencode"):
     return out
 
 
+def parse_copilot_db(path: Path, sid="vscode-copilot", label="VS Code Copilot"):
+    """VS Code Copilot：session-store.db 的 sessions + turns。
+
+    turns 一行是一个来回（user_message / assistant_response 两列），不是 role 字段。
+    只读打开**不能**带 immutable=1：这库常年挂着 -wal，immutable 会读不到 WAL 里的新行。
+    """
+    out = []
+    try:
+        con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        sess = list(con.execute(
+            "select id,cwd,summary,created_at,updated_at from sessions"))
+        turns = {}
+        for t in con.execute("select session_id,turn_index,user_message,"
+                             "assistant_response,timestamp from turns "
+                             "order by session_id,turn_index"):
+            turns.setdefault(t["session_id"], []).append(t)
+        con.close()
+    except sqlite3.Error:
+        return out
+    for sr in sess:
+        rows = turns.get(str(sr["id"]), [])
+        if not rows and not (sr["summary"] or "").strip():
+            continue
+        p = Parsed(sid=str(sr["id"]), source=sid, label=label, src_file=str(path))
+        p.project = sr["cwd"] or ""
+        p.title = (sr["summary"] or "").strip()
+        p.started = to_epoch(sr["created_at"])
+        p.ended = to_epoch(sr["updated_at"]) or p.started
+        for t in rows:
+            ts = to_epoch(t["timestamp"])
+            if (t["user_message"] or "").strip():
+                paths_in_text(t["user_message"], p.artifacts)
+                p.add(ts, "user", t["user_message"])
+            if (t["assistant_response"] or "").strip():
+                paths_in_text(t["assistant_response"], p.artifacts)
+                p.add(ts, "assistant", t["assistant_response"])
+        if p.messages or p.title:
+            out.append(p.finish())
+    return out
+
+
 TRAE_SUM_FILE = re.compile(r"^session_memory_(.+)\.jsonl$")
 TRAE_TOPIC = re.compile(r"^##\s+\[session:\s*([^\]]+)\]\s*(.+)$")
+# 从明文里抽绝对路径：盘符 + 至少 3 个非分隔字符，遇空白/引号/括号停
+PATH_IN_TEXT = re.compile(r"[A-Za-z]:[\\/][^\s\"'`,;()<>|]{2,120}")
 _TRAE_PROJECT = {}
+_TRAE_CANDIDATES = None
+
+
+def _trae_norm(p: str) -> str:
+    """Trae 生成 slug 前的路径规范化：反斜杠→/、去盘符冒号、盘符小写、去尾 /。"""
+    p = p.strip().replace("\\", "/")
+    m = re.match(r"^([A-Za-z]):", p)
+    if m:
+        p = "/" + m.group(1).lower() + p[2:]
+    return p.rstrip("/")
+
+
+def _trae_slug_match(slug: str, path: str) -> bool:
+    """复现 Trae 的 slug 算法做校验：slug 里中文全被换成 '-' 不可逆，只能正向算再比对。
+
+    主体 = 规范化路径(带尾 /)的每个非字母数字字符换成 '-'；
+    尾段 = -p2- + sha256(规范化路径)[:20]。普通项目 = 主体-p2-hash；
+    内部 work-mode 项目 = 主体<随机6位>--p2-hash（随机段插在 pid 和双横线之间）。
+    """
+    norm = _trae_norm(path)
+    h = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:20]
+    bodies = [re.sub(r"[^A-Za-z0-9]", "-", norm + "/")]
+    parts = norm.split("/")     # /c/Users/<谁>/… 的内部项目，slug 主体会省掉前两段
+    if len(parts) > 4:
+        bodies.append(re.sub(r"[^A-Za-z0-9]", "-", "/".join(parts[3:]) + "/"))
+    for body in bodies:
+        if slug == body + "-p2-" + h:
+            return True
+        if re.fullmatch(re.escape(body) + r"[a-z0-9]{4,8}--p2-" + h, slug):
+            return True
+    return False
+
+
+def _trae_candidates():
+    """Trae 打开过哪些项目：TRAE 自己的 workspace.json + work-mode 目录 +
+    ~/.trae-cn 明文里出现过的绝对路径（展开到祖先目录）。
+
+    本机实测 workspace.json 只有 2 个，光靠它几乎什么都还原不出来，
+    真正有货的是 memory 明文里提到的路径。
+    """
+    global _TRAE_CANDIDATES
+    if _TRAE_CANDIDATES is not None:
+        return _TRAE_CANDIDATES
+    raw, out = set(), set()
+
+    appdata = Path(os.environ.get("APPDATA", ""))
+    trae = appdata / "TRAE SOLO CN"
+    try:
+        wjs = [*trae.glob("*/*/workspace.json"), *trae.glob("*/workspace.json")]
+        for wj in wjs:
+            raw.update(re.findall(PATH_IN_TEXT, unquote(
+                wj.read_text(encoding="utf-8", errors="ignore"))))
+    except OSError:
+        pass
+    # state.vscdb 的 ItemTable.value 是 TEXT JSON，SQLite 页里能直接按字节搜出 file:/// URI，
+    # 不用打开数据库。这里藏着 Trae 打开过的项目目录。
+    for db in trae.glob("User/**/state.vscdb"):
+        try:
+            data = db.read_bytes()
+        except OSError:
+            continue
+        for m in re.findall(rb"file:///([^\s\"'<>\\|`]+)", data):
+            raw.add(unquote(m.decode("utf-8", "ignore")).replace("/", "\\"))
+    for wm in (trae / "ModularData" / "ai-agent" / "work-mode-projects",
+               trae / "ModularData" / "ai-agent" / "work-mode" / "projects"):
+        try:
+            raw.update(str(x) for x in wm.iterdir() if x.is_dir())
+        except OSError:
+            pass
+    mem = HOME / ".trae-cn"
+    try:
+        files = [f for f in mem.rglob("*") if f.is_file() and f.suffix in (".md", ".json", ".jsonl")]
+    except OSError:
+        files = []
+    for f in files[:2500]:
+        try:
+            if f.stat().st_size > 2_000_000:
+                continue
+            raw.update(re.findall(PATH_IN_TEXT, f.read_text(encoding="utf-8", errors="ignore")))
+        except OSError:
+            continue
+
+    for p in raw:
+        q = Path(p.strip().rstrip("\"'.,:;"))
+        try:
+            if not q.is_dir():
+                q = q.parent
+        except (OSError, ValueError):
+            continue
+        while len(str(q)) > 3 and str(q) not in out:
+            out.add(str(q))
+            if q.parent == q:
+                break
+            q = q.parent
+
+    # 最后兜底：有 sha256 校验，候选多一点无所谓——直接枚举 home 与 D:\ 下 ≤3 层的真实目录。
+    # 这条路不依赖 Trae 在哪记录过路径，目录在盘上就能被 hash 验明正身。
+    skip = {".git", ".vscode", ".idea", "__pycache__", "node_modules", "appdata",
+            "windows", "program files", "program files (x86)", "perflogs", "recovery",
+            "system volume information", "documents and settings"}
+    stack = [(r, 0) for r in (HOME, Path("D:/")) if r.is_dir()]
+    while stack and len(out) < 30000:
+        d, depth = stack.pop()
+        out.add(str(d))
+        if depth >= 3:
+            continue
+        try:
+            for e in os.scandir(d):
+                if e.is_dir(follow_symlinks=False) and not e.name.startswith((".", "$")) \
+                        and e.name.lower() not in skip:
+                    stack.append((Path(e.path), depth + 1))
+        except OSError:
+            continue
+    _TRAE_CANDIDATES = sorted(out)
+    return _TRAE_CANDIDATES
 
 
 def _trae_project_path(mem_root: Path, slug: str):
-    """slug 里的中文被逐字替换成了 '-'，从同目录 project_memory.md 头部还原真实路径。"""
+    """还原 slug 对应的真实项目路径：先同目录 project_memory.md，再拿候选路径复算 slug 比对。"""
     if slug not in _TRAE_PROJECT:
         real = ""
         try:
@@ -510,6 +672,11 @@ def _trae_project_path(mem_root: Path, slug: str):
                 real = m.group(1).strip().strip('`"')
         except OSError:
             pass
+        if not real:
+            for cand in _trae_candidates():
+                if _trae_slug_match(slug, cand):
+                    real = cand
+                    break
         _TRAE_PROJECT[slug] = real
     return _TRAE_PROJECT[slug]
 
@@ -696,6 +863,8 @@ def refresh(con, sources, force=False, log=None):
                     try:
                         if kind == "opencode_db":
                             handle(f, parse_opencode_db(f, sid, label), sid)
+                        elif kind == "copilot_db":
+                            handle(f, parse_copilot_db(f, sid, label), sid)
                         elif kind == "trae_memory":
                             handle(f, parse_trae_memory(f), sid)
                         else:

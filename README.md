@@ -40,6 +40,7 @@ agenthub mem context "查询"   # 生成可直接粘进提示词的记忆上下�
 | Claude Code / Qoder CN / Qoder / WorkBuddy / QwenWork CN / CatPaw 等 | `~/.<产品>/projects/**/*.jsonl` | 逐条消息 |
 | Codex | `~/.codex/sessions/**/*.jsonl` | 逐条消息 |
 | opencode / ZCode | `~/.local/share/opencode/opencode.db`、`~/.zcode/cli/db/db.sqlite`（同构） | 逐条消息 |
+| VS Code Copilot | `%APPDATA%\Code\User\globalStorage\github.copilot-chat\session-store.db` | 逐条消息 |
 | TraeWork CN | `~/.trae-cn/memory/projects/**`（正文库加密，只索引它自己落盘的会话摘要） | 摘要级 |
 
 **索引不到 ≠ 没聊过**：Cursor、VS Code Copilot Chat（记录在 `workspaceStorage/*/state.vscdb`）、Qoder IDE 侧边栏、以及任何加密正文库，页面首页会如实列出来。
@@ -73,6 +74,12 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveData # 连索引�
 
 ## 更新记录
 
+- **v1.2.0**
+  - TraeWork CN 的项目路径全部可还原：逆向出其 slug 算法（规范化路径逐字符替换 + `-p2-` + `sha256(规范化路径)[:20]`），
+    候选路径来自 Trae 自己的记录 + `state.vscdb` 里的 `file://` URI + 有界目录遍历，sha256 逐条校验（本机 12/12）。
+  - 新增 VS Code Copilot 源：`globalStorage/github.copilot-chat/session-store.db` 的 `sessions`+`turns` 两表，
+    只读打开不带 `immutable`（否则读不到 WAL）。本机 Copilot 暂无历史正文，解析器以 fixture 验证。
+  - 未覆盖清单更新：Cursor 不在列是因为它的对话正文存在服务器端、本机只有空壳元数据，不是没做。
 - **v1.1.0**
   - 查询切词在 ASCII↔中文交界自动切开（`ChatGPT打不开` → 两个线索）；单个长中文串整串查不到时退化为 3 字块 OR（要求至少两块共现），粘在一起的关键词不再查空。
   - 产品自己的自动任务会话（一场里连一条你的提问都没有，如记忆整理）打 `auto` 标记：默认降权排在真人对话后面，卡片带「自动任务」角标，筛选栏可一键隐藏。
