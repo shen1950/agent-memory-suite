@@ -194,6 +194,7 @@ class Parsed:
     models: set = field(default_factory=set)
     messages: list = field(default_factory=list)   # (ts, role, text)
     artifacts: set = field(default_factory=set)
+    auto: int = 0      # 1 = 产品自己的自动任务（一场里连一条 user/summary 都没有）
 
     def add(self, ts, role, text):
         text = clean_text(text)
@@ -218,6 +219,8 @@ class Parsed:
                         break
                 if self.title:
                     break
+        if not any(role in ("user", "summary") for _ts, role, _text in self.messages):
+            self.auto = 1
         return self
 
 
@@ -595,7 +598,8 @@ create table if not exists file(path text primary key, sig text, source text);
 create table if not exists session(
   sid text primary key, source text, label text, title text, project text,
   project_name text, started real, ended real, day text, n_msg integer,
-  models text, branch text, src_file text, artifacts text);
+  models text, branch text, src_file text, artifacts text,
+  auto integer not null default 0);
 create index if not exists session_day on session(day);
 create virtual table if not exists msg_fts using fts5(
   body, sid unindexed, role unindexed, ts unindexed, day unindexed, seq unindexed,
@@ -610,6 +614,10 @@ def connect():
                           check_same_thread=False)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    try:    # 老库补列：ALTER ADD COLUMN 是瞬时操作，列已存在则报错吞掉
+        con.execute("alter table session add column auto integer not null default 0")
+    except sqlite3.OperationalError:
+        pass
     con.execute("pragma journal_mode=WAL")
     con.execute("pragma synchronous=NORMAL")
     return con
@@ -636,11 +644,11 @@ def store_session(con, p: Parsed):
     drop_session(con, sid)
     con.execute(
         "insert into session(sid,source,label,title,project,project_name,started,ended,"
-        "day,n_msg,models,branch,src_file,artifacts) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "day,n_msg,models,branch,src_file,artifacts,auto) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (sid, p.source, p.label, p.title or "(无标题)", p.project, project_name(p.project),
          p.started, p.ended, day_of(p.ended or p.started), len(p.messages),
          ",".join(sorted(p.models))[:200], p.branch, p.src_file,
-         "\n".join(sorted(p.artifacts))))
+         "\n".join(sorted(p.artifacts)), p.auto))
     con.executemany(
         "insert into msg_fts(body,sid,role,ts,day,seq) values(?,?,?,?,?,?)",
         [(text, sid, role, ts, day_of(ts), seq)
@@ -726,8 +734,29 @@ def rebuild(con, sources, log=None):
 # 检索
 # --------------------------------------------------------------------------
 
+RUN_RE = re.compile(r"[A-Za-z0-9]+(?:[._\-][A-Za-z0-9]+)*|[\u3400-\u4dbf\u4e00-\u9fff]+")
+
+
 def split_terms(q):
-    return [t for t in re.split(r"\s+", (q or "").strip()) if t][:8]
+    """先按空白切，再在 ASCII↔中文 交界处切：「ChatGPT打不开」→ 两个线索。
+
+    只有当切出的每块都 ≥2 字、且拼回去恰好等于原串时才切；
+    文件名（带点）、带标点的串、含单字的串都保持原样，免得 AND 语义把它们查死。
+    """
+    out = []
+    for tok in re.split(r"\s+", (q or "").strip()):
+        if not tok:
+            continue
+        parts = RUN_RE.findall(tok)
+        if len(parts) > 1 and "".join(parts) == tok and all(len(p) >= 2 for p in parts):
+            out += parts
+        else:
+            out.append(tok)
+    return out[:8]
+
+
+def cjk_blocks(term, size=3):
+    return [term[i:i + size] for i in range(0, len(term) - size + 1, size)]
 
 
 def scope_sql(sources, day_from, day_to, alias):
@@ -778,7 +807,8 @@ def term_hits(con, term, sources, day_from, day_to):
     return counts, meta
 
 
-def search(con, q, sources=None, day_from=None, day_to=None, limit=60, sort="relevance"):
+def search(con, q, sources=None, day_from=None, day_to=None, limit=60, sort="relevance",
+           hide_auto=False):
     terms = split_terms(q)
     if not terms:
         return []
@@ -788,8 +818,27 @@ def search(con, q, sources=None, day_from=None, day_to=None, limit=60, sort="rel
         cand = set(per_term[0][0])
         for counts, _ in per_term[1:]:
             cand &= set(counts)
+        if not cand and len(terms) == 1 and len(terms[0]) >= 6 \
+                and re.fullmatch(r"[\u3400-\u4dbf\u4e00-\u9fff]+", terms[0]):
+            # 整串查不到：多半是把几个关键词连着粘在一起了。退化成 3 字块 OR，
+            # 但要求至少两块同时命中，避免单块把无关会话捞上来。
+            blocks = [b for b in cjk_blocks(terms[0]) if len(b) >= TRIGRAM_MIN]
+            if len(blocks) >= 2:
+                per_term = [term_hits(con, b, sources, day_from, day_to) for b in blocks]
+                seen = {}
+                for counts, _ in per_term:
+                    for sid in counts:
+                        seen[sid] = seen.get(sid, 0) + 1
+                cand = {sid for sid, k in seen.items() if k >= 2}
         if not cand:
             return []
+        auto = {r["sid"] for r in con.execute(
+            f"select sid from session where auto=1 and sid in ({','.join('?' * len(cand))})",
+            tuple(cand))}
+        if hide_auto:
+            cand -= auto
+            if not cand:
+                return []
 
         scored = []
         for sid in cand:
@@ -798,6 +847,8 @@ def search(con, q, sources=None, day_from=None, day_to=None, limit=60, sort="rel
                 n = counts.get(sid, 0)
                 hits += n
                 score += min(n, 20) + (6 if sid in meta_only else 0)
+            if sid in auto:
+                score *= 0.35      # 产品自动任务排在真人对话后面，但不消失
             scored.append((score, hits, sid))
         scored.sort(key=lambda t: -t[0])
         top = scored[:limit]
@@ -827,6 +878,7 @@ def search(con, q, sources=None, day_from=None, day_to=None, limit=60, sort="rel
                 "artifacts": [a for a in (meta["artifacts"] or "").split("\n") if a],
                 "hits": hits, "score": score, "snippets": snips_,
                 "open_level": opener_for(meta["source"])["level"],
+                "auto": 1 if sid in auto else 0,
             })
     if sort == "time":
         results.sort(key=lambda r: -(r["ended"] or r["started"] or 0))
@@ -1155,7 +1207,8 @@ def serve(port, open_browser, initial_query):
                     self._json({"results": search(con, q.get("q", ""), srcs,
                                                   q.get("from") or None, q.get("to") or None,
                                                   min(int(q.get("limit", 60)), 300),
-                                                  q.get("sort", "relevance")),
+                                                  q.get("sort", "relevance"),
+                                                  hide_auto=q.get("auto") == "0"),
                                 "progress": STATE["progress"], "scanned": scanned})
                 elif u.path == "/api/session":
                     self._json(session_detail(con, q.get("id", "")) or {"error": "会话不在索引中"})
@@ -1314,6 +1367,8 @@ select{border:1px solid var(--line);border-radius:5px;padding:4px 6px;font-size:
   <span style="color:#64748B">产品</span><span id="chips"></span>
   <span style="color:#64748B;margin-left:6px">日期</span>
   <input type="date" id="from"><span>→</span><input type="date" id="to">
+  <span class="chip" id="noauto" title="产品自己跑的自动任务（记忆整理等）一场里没有你的提问，默认降权排在后面，勾上则完全不看"
+   onclick="this.classList.toggle('on');if($('q').value.trim())go()">隐藏自动任务</span>
   <span class="status" id="status"></span>
  </div>
 </div>
@@ -1386,6 +1441,7 @@ async function go(fresh){
  if(sel.size)p.set('sources',[...sel].join(','));
  if($('from').value)p.set('from',$('from').value);
  if($('to').value)p.set('to',$('to').value);
+ if($('noauto').classList.contains('on'))p.set('auto','0');
  let r; try{r=await j('/api/search?'+p)}catch(e){$('status').textContent='检索失败：服务可能已被关闭，重新双击桌面图标即可';return}
  if(r.error){$('status').textContent='出错了：'+r.error;return}
  $('status').textContent=`找到 ${r.results.length} 场对话${r.scanned?' · 已扫描过新记录':''}`;
@@ -1402,7 +1458,7 @@ function card(x){
  const arts=(x.artifacts||[]).slice(0,14);
  const when=fmt(x.started)+(x.ended&&x.ended!==x.started?' → '+fmt(x.ended):'');
  return `<div class="card"><div class="top">
-  <span class="tag">${esc(x.label)}</span><span class="when">${when}</span>
+  <span class="tag">${esc(x.label)}</span>${x.auto?'<span class="tag" style="background:#fff;color:#64748B;border-color:#E2E8F0">自动任务</span>':''}<span class="when">${when}</span>
   <span class="hits">${x.hits?`提到 ${x.hits} 次 · `:'线索在标题/项目/产物 · '}这场对话 ${x.n_msg} 条</span></div>
  <div class="ttl">${esc(x.title)}</div>
  <div class="proj">项目 <code>${esc(x.project_name)}</code> ${esc(x.project||'')}
@@ -1473,9 +1529,19 @@ setInterval(()=>{meta().catch(()=>{})},20000);
 # CLI
 # --------------------------------------------------------------------------
 
-def cmd_status():
-    con = connect()
-    ov = overview(con)
+def _http_json(path, port):
+    with urlopen(f"http://127.0.0.1:{port}{path}", timeout=180) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def cmd_status(port):
+    if already_running(port):
+        # 服务在跑就直接问它：再开一个写者会和它抢 SQLite 锁（database is locked）
+        ov = _http_json("/api/meta", port)
+    else:
+        con = connect()
+        ov = overview(con)
+        con.close()
     counts = {s["source"]: s for s in ov["sources"]}
     print(f"索引文件: {DB_PATH}")
     print(f"{'产品':<22}{'会话数':>8}   最近活跃")
@@ -1487,13 +1553,16 @@ def cmd_status():
     print(f"合计 {ov['total']} 场对话、{ov['messages']} 条消息，跨 {ov['days']} 天")
     if ov["last_refresh"]:
         print(f"索引更新于 {fmt_time(ov['last_refresh'])}")
-    con.close()
 
 
-def cmd_cli(q):
-    con = connect()
-    refresh(con, discover_sources(), log=lambda *_: None)
-    res = search(con, q, limit=25)
+def cmd_cli(q, port):
+    if already_running(port):
+        res = _http_json("/api/search?q=" + quote(q) + "&limit=25", port)["results"]
+    else:
+        con = connect()
+        refresh(con, discover_sources(), log=lambda *_: None)
+        res = search(con, q, limit=25)
+        con.close()
     if not res:
         print("没有命中。试试更短的关键词，或只搜产物文件名。")
         return
@@ -1504,7 +1573,6 @@ def cmd_cli(q):
         print(f"    命中   {r['hits']} 处" + (f"，产物 {len(r['artifacts'])} 个" if r["artifacts"] else ""))
         for s in r["snippets"][:2]:
             print(f"      · {re.sub('<[^>]+>', '', s['html'])[:180]}")
-    con.close()
 
 
 def cmd_stop(port):
@@ -1549,9 +1617,9 @@ def main(argv=None):
     attach_log()
 
     if a.status:
-        cmd_status()
+        cmd_status(a.port)
     elif a.cli:
-        cmd_cli(a.cli)
+        cmd_cli(a.cli, a.port)
     elif a.stop:
         cmd_stop(a.port)
     elif a.rebuild:
@@ -1559,7 +1627,7 @@ def main(argv=None):
         print("全量重建索引…")
         rebuild(con, discover_sources(), log=print)
         con.close()
-        cmd_status()
+        cmd_status(a.port)
     else:
         serve(a.port, not a.no_open, " ".join(a.query))
     return 0

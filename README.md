@@ -71,6 +71,14 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveData # 连索引�
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) —— 索引结构、FTS5 在本机 SQLite 上的坑、片段抓取的两步法、跳转层与同步机制的设计理由。
 - [skills/agent-collab/SKILL.md](skills/agent-collab/SKILL.md) —— 给 Agent 自己读的协作规则（装到 `~/.agents/skills/` 后各产品共用）。
 
+## 更新记录
+
+- **v1.1.0**
+  - 查询切词在 ASCII↔中文交界自动切开（`ChatGPT打不开` → 两个线索）；单个长中文串整串查不到时退化为 3 字块 OR（要求至少两块共现），粘在一起的关键词不再查空。
+  - 产品自己的自动任务会话（一场里连一条你的提问都没有，如记忆整理）打 `auto` 标记：默认降权排在真人对话后面，卡片带「自动任务」角标，筛选栏可一键隐藏。
+  - `--cli` / `--status` 在服务运行时改走本地 HTTP，不再开第二个写者和在役服务抢 SQLite 锁。
+- **v1.0.0** 首版：AgentFind 检索 + 跳回原对话，AgentHub 共享记忆与派工。
+
 ## License
 
 MIT
