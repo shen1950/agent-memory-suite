@@ -78,6 +78,13 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveData # 连索引�
 
 ## 更新记录
 
+- **v1.3.3**
+  - 两个桌面图标现在都保证"点了就有框"：`WshShell.Exec(...).StdIn.ReadAll()` 在装了国产安全软件的机器上
+    会抛"错误的文件模式"（连 `cmd /c echo` 都读不出来），关闭图标的弹框那一行根本执行不到，
+    于是用户只看到页面、以为"关闭"按钮开了标签页。改为 `stop.cmd` 把 `--stop` 输出重定向到临时文件，
+    VBS 用 `ADODB.Stream`(utf-8) 读回来弹框，实测显示"已停止 1 个 AgentFind 服务进程（PID）…"。
+  - 打开图标不再盲等 2.5 秒：改成最多 12 秒轮询服务端口，就绪才开页面；起不来就明确弹框说明，
+    不再开一个连不上的标签页。桌面快捷方式参数补上引号（原先 `$q` 未定义）。
 - **v1.3.1**
   - 桌面快捷方式不再用 `pythonw.exe`：部分机器上安全软件只放行 `python.exe`，`pythonw.exe` 能监听但
     收不到任何回环连接，双击图标看起来就像程序坏了。改为 `wscript` 隐藏窗口启动 `python.exe`，效果相同。

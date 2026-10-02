@@ -148,3 +148,30 @@ TraeWork 把会话摘要存在 `~/.trae-cn/memory/projects/<slug>/...`，slug �
 
 已知遗留：启动时的后台扫描（约 10s）持有索引锁，期间 `/api/meta` 排队等待，表现为**第一次打开页面要等一下**。
 彻底解法是读路径改用临时只读连接（WAL 允许并发读），需要给 `search` / `overview` / `session_detail` 加"不持锁"分支。
+
+## 16. 桌面图标的反馈必须由文件而非管道传递（v1.3.3）
+
+`stop.vbs` 原先这样取 `--stop` 的输出再弹框：
+
+```vbs
+Set o = s.Exec("... agentfind.py --stop")
+MsgBox Trim(o.StdIn.ReadAll())          ' ← 这一行抛"错误的文件模式"
+```
+
+**在这类机器上 `WshShell.Exec` 的 stdout 管道根本读不出来**——换成 `cmd.exe /c echo hello` 同样报错，
+所以与本项目代码无关，是环境层面的限制（`Exec` 本身能起进程、`ExitCode` 也拿得到，只有 `StdIn.ReadAll()` 挂）。
+后果很隐蔽：脚本在弹框那一行死掉，用户点"关闭"看不到任何东西，只会把紧接着出现的页面（上一秒"打开"图标
+延迟 2.5s 才开的标签页）算到"关闭"头上。
+
+**修法：反馈一律走文件，不走管道。**
+
+1. `install.ps1` 生成 `~/.agentfind/stop.cmd`，把输出重定向到 `%TEMP%\agentfind_stop.txt`；
+   这个 .cmd 用 **ANSI 码页**写（`[Text.Encoding]::Default`），因为 cmd.exe 按本地码页解析，
+   Unicode 写会让中文用户名路径失效。
+2. `stop.vbs` 用 `s.Run(..., 0, True)` 等它跑完，再用 `ADODB.Stream`（`Type=2`、`Charset="utf-8"`）
+   读回来弹框——python 侧带 `-X utf8`，落盘是 UTF-8 字节，直接 `OpenTextFile` 会按 GBK 读成乱码。
+3. 读不到文件时兜底一句固定文案，保证"点了一定有框"。
+
+"打开"图标同理不再盲等：VBS 用 `WinHttp.WinHttpRequest.5.1`（`Option(6)=False` 关掉重定向跟随）轮询
+`/api/meta`，最多 12 秒，端口就绪才开页面，等不到就弹框说明原因——不再开一个连不上的标签页。
+探测代码可以直接 `cscript //nologo x.vbs` 单跑，输出乱码时用 `//U` 再 `iconv -f UTF-16LE`。

@@ -61,12 +61,55 @@ if ($DesktopShortcuts) {
 Set s = CreateObject("WScript.Shell")
 s.CurrentDirectory = "$afDir"
 s.Run Chr(34) & "$pyExe" & Chr(34) & " -X utf8 " & Chr(34) & "$afDir\agentfind.py" & Chr(34) & " serve --no-open", 0, False
-WScript.Sleep 2500
-s.Run "http://127.0.0.1:8765/", 1, False
+ok = False
+For i = 1 To 30
+    WScript.Sleep 400
+    On Error Resume Next
+    Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+    http.Option(6) = False
+    http.Open "GET", "http://127.0.0.1:8765/api/meta", False
+    http.Send
+    If Err.Number = 0 Then
+        If http.Status = 200 Then ok = True
+    End If
+    On Error GoTo 0
+    If ok Then Exit For
+Next
+If ok Then
+    s.Run "http://127.0.0.1:8765/", 1, False
+Else
+    MsgBox "等了 12 秒，服务端口还是没响应，所以没有打开页面（打开了也是打不开）。" & vbCrLf & _
+           "请在终端里跑一次 agentfind 看报错，或双击「关闭找 AI 对话」后重新打开。", _
+           vbExclamation, "找 AI 对话"
+End If
 "@
+    # 关闭：把 --stop 的输出落到临时文件再读回来弹框。
+    # 不要用 WshShell.Exec(...).StdIn.ReadAll()——装了国产安全软件的机器上这条会抛
+    # "错误的文件模式"（连 cmd /c echo 都读不出来），弹框根本不执行，用户点了像没反应。
+    $stopCmd = @"
+@echo off
+"$pyExe" -X utf8 "$afDir\agentfind.py" --stop > "%TEMP%\agentfind_stop.txt" 2>&1
+"@
+    # .cmd 由 cmd.exe 按本地 ANSI 码页解析，用 Unicode 写会让中文用户名路径失效
+    [System.IO.File]::WriteAllText((Join-Path $afDir 'stop.cmd'), $stopCmd, [System.Text.Encoding]::Default)
     $vbsStop = @"
 Set s = CreateObject("WScript.Shell")
-s.Run Chr(34) & "$pyExe" & Chr(34) & " -X utf8 " & Chr(34) & "$afDir\agentfind.py" & Chr(34) & " --stop", 0, False
+Set fso = CreateObject("Scripting.FileSystemObject")
+tmp = s.ExpandEnvironmentStrings("%TEMP%") & "\agentfind_stop.txt"
+If fso.FileExists(tmp) Then fso.DeleteFile tmp, True
+s.Run Chr(34) & "$afDir\stop.cmd" & Chr(34), 0, True
+msg = "已经关掉检索服务了，索引文件都留着，下次双击「找 AI 对话」还能用。"
+If fso.FileExists(tmp) Then
+    Set st = CreateObject("ADODB.Stream")
+    st.Type = 2
+    st.Charset = "utf-8"
+    st.Open
+    st.LoadFromFile tmp
+    txt = Trim(st.ReadText(-1))
+    st.Close
+    If Len(txt) > 0 Then msg = txt
+End If
+MsgBox msg, vbInformation, "关闭找 AI 对话"
 "@
     $runVbs = Join-Path $afDir 'start-hidden.vbs'
     $stopVbs = Join-Path $afDir 'stop.vbs'
@@ -79,7 +122,7 @@ s.Run Chr(34) & "$pyExe" & Chr(34) & " -X utf8 " & Chr(34) & "$afDir\agentfind.p
 
     $lnk = $ws.CreateShortcut((Join-Path $desk '找 AI 对话.lnk'))
     $lnk.TargetPath = "$env:SystemRoot\System32\wscript.exe"
-    $lnk.Arguments = "$q$runVbs$q"
+    $lnk.Arguments = "`"$runVbs`""
     $lnk.IconLocation = "$icon,0"
     $lnk.WorkingDirectory = $afDir
     $lnk.Description = '跨 Agent 对话检索（无命令行窗口）'
@@ -87,7 +130,7 @@ s.Run Chr(34) & "$pyExe" & Chr(34) & " -X utf8 " & Chr(34) & "$afDir\agentfind.p
 
     $lnk2 = $ws.CreateShortcut((Join-Path $desk '关闭找 AI 对话.lnk'))
     $lnk2.TargetPath = "$env:SystemRoot\System32\wscript.exe"
-    $lnk2.Arguments = "$q$stopVbs$q"
+    $lnk2.Arguments = "`"$stopVbs`""
     $lnk2.IconLocation = "$icon,0"
     $lnk2.WorkingDirectory = $afDir
     $lnk2.Description = '停止检索服务，索引保留'
