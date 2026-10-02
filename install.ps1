@@ -61,6 +61,8 @@ if ($DesktopShortcuts) {
 Set s = CreateObject("WScript.Shell")
 s.CurrentDirectory = "$afDir"
 s.Run Chr(34) & "$pyExe" & Chr(34) & " -X utf8 " & Chr(34) & "$afDir\agentfind.py" & Chr(34) & " serve --no-open", 0, False
+WScript.Sleep 2500
+s.Run "http://127.0.0.1:8765/", 1, False
 "@
     $vbsStop = @"
 Set s = CreateObject("WScript.Shell")
