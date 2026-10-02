@@ -102,3 +102,27 @@ TraeWork 把会话摘要存在 `~/.trae-cn/memory/projects/<slug>/...`，slug �
   本地补 `bubbleId:` 也没有。把它留在未覆盖清单并写明原因，比接进来显示 0 条更诚实。
 - 若以后要接 Cursor：结构是 `composerData`（头）+ `bubbleId:<composerId>:<bubbleId>`（正文）两段拼，
   索引时还要注意同一 sessionId 会在多个 workspace 目录重复出现，得去重。
+
+## 14. 按形状自动发现新 Agent（v1.3.0）
+
+目标：用户装完新 Agent 不用改代码。所以发现层不认产品名，只认**结构**：
+
+| 形状 | 判定 | kind |
+|---|---|---|
+| `<root>/projects/*/*.jsonl` | 目录存在且有 jsonl | `claude_jsonl` |
+| `<root>/sessions/**/session*.jsonl[.zst\|.zstd]` | 有 zstd 会话文件 | `dsh_jsonl_zst` |
+| sqlite 含 `session`+`message`+`part` 三表 | 开库看 `sqlite_master` | `opencode_db` |
+| sqlite 含 `sessions`+`turns` 两表 | 同上 | `copilot_db` |
+
+三条硬约束，都是踩出来的：
+
+1. **绝不整树 rglob**。候选根目录里混着 Electron 应用（一个 profile 能有几万个文件），
+   第一版用 `rglob("*.db")` 扫一遍是 **19.5s**；改成固定几种深度限定的 glob（`db/*.db`、
+   `User/globalStorage/*/*.db` 等）+ 每类限量后 **0.36s**。发现结果再缓存 10 分钟（装软件不是高频事件）。
+2. **必须去重**，否则同一个产品会被索引两遍：`%APPDATA%\Code` 里就装着已登记的 Copilot 库，
+   `@deepseek-ai` 与 `~/.dsh` 是同一个产品的两个目录。规则是①候选目录里已含登记过的根路径就跳过；
+   ②按产品名 token 双向包含匹配（≥4 字符）跳过。
+3. **认不出来就点名，别沉默**。有 `.db` / `.jsonl` / `IndexedDB` / `Local Storage/leveldb` 这类"存过聊天"的痕迹、
+   但没有任何解析器命中的目录，会进 `UNRECOGNIZED`，由 `/api/meta` 带给首页：
+   "另外自动发现了 X / Y：像是 Agent 的数据目录，但还没有对应解析器"。
+   这样新装 Agent 最多是"看得见待补"，而不是"查不到还以为是自己的问题"。上限 10 个，避免刷屏。

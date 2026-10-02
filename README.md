@@ -34,11 +34,15 @@ agenthub mem context "查询"   # 生成可直接粘进提示词的记忆上下�
 ## 已验证能索引的产品
 
 自动发现规则：任何把会话存成 `~/.<产品>/projects/<项目>/<会话>.jsonl` 的 Agent 都会被纳入，无需改代码。
+v1.3 起发现逻辑改成**按形状嗅探**（不再靠产品名单）：`projects/**.jsonl`、`sessions/**.jsonl[.zst|.zstd]`、
+以及 sqlite 里的表集合（`session/message/part` 或 `sessions/turns`），扫描 home 与 `%APPDATA%` 下像 Agent 的目录，
+结果缓存 10 分钟。**新装的 Agent 要么被自动收录，要么以目录名出现在首页"还没解析器"清单里**，不会静默漏掉。
 
 | 产品 | 记录位置 | 粒度 |
 |---|---|---|
 | Claude Code / Qoder CN / Qoder / WorkBuddy / QwenWork CN / CatPaw 等 | `~/.<产品>/projects/**/*.jsonl` | 逐条消息 |
 | Codex | `~/.codex/sessions/**/*.jsonl` | 逐条消息 |
+| DeepSeek DSH | `~/.dsh/sessions/<工作区>/session-*/session.vN.jsonl.zstd` | 逐条消息（需 Python 3.14+ 的标准库 zstd，低版本自动跳过该源） |
 | opencode / ZCode | `~/.local/share/opencode/opencode.db`、`~/.zcode/cli/db/db.sqlite`（同构） | 逐条消息 |
 | VS Code Copilot | `%APPDATA%\Code\User\globalStorage\github.copilot-chat\session-store.db` | 逐条消息 |
 | TraeWork CN | `~/.trae-cn/memory/projects/**`（正文库加密，只索引它自己落盘的会话摘要） | 摘要级 |
@@ -74,6 +78,11 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveData # 连索引�
 
 ## 更新记录
 
+- **v1.3.0**
+  - 新装 Agent 自动收录：发现逻辑从"写死产品名单"改成按形状嗅探（jsonl 目录结构 + sqlite 表集合），
+    扫 home 与 `%APPDATA%`，结果缓存 10 分钟；识别不出来的目录会在首页点名，不会静默漏。
+  - 新增 DeepSeek DSH 源：`~/.dsh/sessions/**/session.vN.jsonl.zstd`，zstd 压缩的 JSONL，
+    项目路径取自会话头的 `cwd`。
 - **v1.2.0**
   - TraeWork CN 的项目路径全部可还原：逆向出其 slug 算法（规范化路径逐字符替换 + `-p2-` + `sha256(规范化路径)[:20]`），
     候选路径来自 Trae 自己的记录 + `state.vscdb` 里的 `file://` URI + 有界目录遍历，sha256 逐条校验（本机 12/12）。

@@ -299,10 +299,129 @@ def discover_sources():
     add(TRAE_SOURCE, TRAE_LABEL, "trae_memory", [HOME / ".trae-cn/memory/projects"])
     add("vscode-copilot", "VS Code Copilot", "copilot_db",
         [HOME / "AppData/Roaming/Code/User/globalStorage/github.copilot-chat"])
+    add("dsh", "DeepSeek DSH", "dsh_jsonl_zst", [HOME / ".dsh/sessions"])
+    root_paths = [str(r) for _s, _l, _k, rs in out for r in rs]
+    known = set()
+    for s, label, _k, _rs in out:
+        known.update(w.lower() for w in re.split(r"[^A-Za-z0-9]+", s + " " + label) if len(w) >= 4)
+    anchors = (HOME, Path(os.environ.get("APPDATA", "")))
+    for rp in root_paths:
+        for anc in anchors:
+            try:
+                known.add(_token(Path(rp).relative_to(anc).parts[0]))
+                break
+            except (ValueError, IndexError):
+                continue
+    global UNRECOGNIZED
+    extra, UNRECOGNIZED = _autodiscover(root_paths, known)
+    for sid, label, kind, roots in extra:
+        add(sid, label, kind, roots)
     return out
 
 
-KIND_PATTERN = {"opencode_db": "*.db", "copilot_db": "session-store.db", "trae_memory": "*"}
+KIND_PATTERN = {"opencode_db": "*.db", "copilot_db": "session-store.db",
+                "dsh_jsonl_zst": "*", "trae_memory": "*"}
+
+# 像 Agent 数据目录的名字特征；命中才去嗅探，避免把 Adobe/Ansys 那些也扫一遍
+AGENTISH = re.compile(
+    r"chat|agent|cli|code|copilot|llm|gpt|claude|codex|gemini|grok|marvis|mimo|dsh|qoder"
+    r"|qwen|trae|workbuddy|catpaw|deepseek|kimi|minimax|doubao|cursor|windsurf|aider|claw"
+    r"|buddy|opencode|zcode|genie|solob|session|conversation", re.I)
+UNRECOGNIZED = []                       # 每次 discover_sources() 重建
+_AUTO = {"t": 0.0, "sources": [], "unknown": []}
+AUTO_TTL = 600                          # 秒：装软件不是高频事件，10 分钟内复用嗅探结果
+
+
+def sniff_db_kind(f: Path):
+    """看 sqlite 里的表集合判断它属于哪种格式家族，完全不认产品名。"""
+    try:
+        con = sqlite3.connect(f.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+        names = {r[0] for r in con.execute(
+            "select name from sqlite_master where type='table'")}
+        con.close()
+    except sqlite3.Error:
+        return ""
+    if {"session", "message", "part"} <= names:
+        return "opencode_db"
+    if {"sessions", "turns"} <= names:
+        return "copilot_db"
+    return ""
+
+
+DB_GLOBS = ("*.db", "*/db/*.db", "db/*.db", "*/*/db/*.db",
+            "User/globalStorage/*/*.db", "User/workspaceStorage/*/*.db",
+            "globalStorage/*/*.db", "data/*.db", "store/*.db")
+CHAT_GLOBS = ("*/*.jsonl", "*/*/*.jsonl", "*/*.jsonl.zst", "*/*.jsonl.zstd",
+              "*/*/*.jsonl.zst", "*/*/*.jsonl.zstd")
+
+
+def _bounded(root: Path, patterns, limit=40):
+    """只按固定深度几种写法找文件，绝不整树 rglob（APPDATA 下一个 Electron 目录能有几万个文件）。"""
+    got, n = [], 0
+    for pat in patterns:
+        try:
+            for f in root.glob(pat):
+                if f.is_file():
+                    got.append(f)
+                    n += 1
+                    if n >= limit:
+                        return got
+        except OSError:
+            continue
+    return got
+
+
+def _token(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _autodiscover(known_paths, known_tokens):
+    """按形状发现新装 Agent，返回 (sources, 还没解析器的可疑目录)。"""
+    if time.time() - _AUTO["t"] < AUTO_TTL:
+        return _AUTO["sources"], _AUTO["unknown"]
+    found, unknown = [], []
+    for base in (HOME, Path(os.environ.get("APPDATA", ""))):
+        try:
+            entries = sorted(e for e in base.iterdir() if e.is_dir())
+        except OSError:
+            continue
+        for e in entries:
+            if e.name in SCAN_SKIP or e.name in (".", ".."):
+                continue
+            if any(len(t) >= 4 and (t in _token(e.name) or _token(e.name) in t)
+                   for t in known_tokens):      # 已经用另一个根目录收录过了
+                continue
+            if any(p.lower().startswith(str(e).lower()) for p in known_paths):
+                continue                          # 已收录的根目录就在这个候选目录里面
+            looks_agent = bool(AGENTISH.search(e.name)) or any(
+                (e / sub).is_dir() for sub in ("sessions", "projects", "chats", "db"))
+            if not looks_agent:
+                continue
+            hit = ""
+            prj = e / "projects"
+            if prj.is_dir() and _bounded(prj, ("*/*.jsonl",), 1):
+                found.append((e.name, pretty(e.name), "claude_jsonl", [prj]))
+                hit = "claude_jsonl"
+            sess = e / "sessions"
+            if not hit and sess.is_dir() and _bounded(sess, CHAT_GLOBS, 1):
+                found.append((e.name, pretty(e.name), "dsh_jsonl_zst", [sess]))
+                hit = "dsh_jsonl_zst"
+            if not hit:
+                for db in _bounded(e, DB_GLOBS, 24):
+                    kind = sniff_db_kind(db)
+                    if kind:
+                        found.append((e.name, pretty(e.name), kind, [db]))
+                        hit = kind
+                        break
+            if hit:
+                known_tokens.add(_token(e.name))
+                continue
+            # 没命中格式，但有"存过聊天"的痕迹 → 如实报出来，别静默漏掉
+            if _bounded(e, ("*.db", "*/*.db", "db/*.db"), 1) or _bounded(e, CHAT_GLOBS, 1) \
+                    or (e / "IndexedDB").is_dir() or (e / "Local Storage" / "leveldb").is_dir():
+                unknown.append(e.name.lstrip("."))
+    _AUTO.update(t=time.time(), sources=found, unknown=sorted(set(unknown))[:10])
+    return _AUTO["sources"], _AUTO["unknown"]
 
 
 def iter_files(roots, pattern):
@@ -496,6 +615,69 @@ def parse_opencode_db(path: Path, sid="opencode", label="opencode"):
     return out
 
 
+def _zstd_decompress(raw: bytes):
+    """DSH 的会话是 zstd 压缩的 JSONL；3.14+ 用标准库，否则退回可选的 zstandard。"""
+    try:
+        from compression import zstd
+        return zstd.decompress(raw)
+    except ImportError:
+        pass
+    try:
+        import zstandard
+        return zstandard.ZstdDecompressor().decompress(raw, max_output_size=64 << 20)
+    except Exception:
+        return b""
+
+
+def parse_dsh_file(path: Path, sid="dsh", label="DeepSeek DSH"):
+    """DeepSeek DSH：~/.dsh/sessions/<工作区>/session-<uuid>/session.vN.jsonl.zstd。"""
+    raw = _zstd_decompress(path.read_bytes())
+    if not raw:
+        return []
+    p = None
+    for line in raw.decode("utf-8", "ignore").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(r, dict):
+            continue
+        kind = r.get("type")
+        if kind == "session":
+            p = Parsed(sid=str(r.get("id") or path.parent.name), source=sid, label=label,
+                       src_file=str(path))
+            p.project = str(r.get("cwd") or "")
+            p.started = to_epoch(r.get("createdAt"))
+            continue
+        if p is None or not isinstance(r.get("data"), dict):
+            continue
+        ts = to_epoch(r.get("time")) or p.started
+        d = r["data"]
+        # system/assistant 把内容嵌在 data.message 里，user/message 直接放 data 上
+        msg = d.get("message") if isinstance(d.get("message"), dict) else d
+        role = msg.get("role")
+        if isinstance(role, str) and role in ("user", "assistant"):
+            content = msg.get("content")
+            blocks = [{"type": "text", "text": content}] if isinstance(content, str) \
+                else (content or [])
+            for b in blocks:
+                if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                    paths_in_text(b["text"], p.artifacts)
+                    p.add(ts, role, b["text"])
+        elif kind == "tool/call":
+            inp = d.get("args") if isinstance(d.get("args"), dict) else d.get("input")
+            inp = inp if isinstance(inp, dict) else {}
+            collect_paths(inp, p.artifacts)
+            bits = [str(inp[k]).strip()[:400] for k in ("command", "path", "file_path", "pattern")
+                    if isinstance(inp.get(k), str) and inp.get(k, "").strip()]
+            p.add(ts, "tool", f"[调用 {d.get('name') or d.get('tool') or 'tool'}] "
+                              + " | ".join(bits))
+        p.ended = max(p.ended or ts or 0, ts or 0)
+    return [p.finish()] if p and p.messages else []
+
+
 def parse_copilot_db(path: Path, sid="vscode-copilot", label="VS Code Copilot"):
     """VS Code Copilot：session-store.db 的 sessions + turns。
 
@@ -539,6 +721,7 @@ def parse_copilot_db(path: Path, sid="vscode-copilot", label="VS Code Copilot"):
 
 
 TRAE_SUM_FILE = re.compile(r"^session_memory_(.+)\.jsonl$")
+DSH_FILE = re.compile(r"^session\..*\.jsonl\.(zst|zstd)$")
 TRAE_TOPIC = re.compile(r"^##\s+\[session:\s*([^\]]+)\]\s*(.+)$")
 # 从明文里抽绝对路径：盘符 + 至少 3 个非分隔字符，遇空白/引号/括号停
 PATH_IN_TEXT = re.compile(r"[A-Za-z]:[\\/][^\s\"'`,;()<>|]{2,120}")
@@ -865,6 +1048,9 @@ def refresh(con, sources, force=False, log=None):
                             handle(f, parse_opencode_db(f, sid, label), sid)
                         elif kind == "copilot_db":
                             handle(f, parse_copilot_db(f, sid, label), sid)
+                        elif kind == "dsh_jsonl_zst":
+                            if DSH_FILE.match(f.name):
+                                handle(f, parse_dsh_file(f, sid, label), sid)
                         elif kind == "trae_memory":
                             handle(f, parse_trae_memory(f), sid)
                         else:
@@ -1286,7 +1472,8 @@ def overview(con):
         msgs = con.execute("select count(*) c from msg_fts").fetchone()["c"]
         last = con.execute("select v from meta where k='last_refresh'").fetchone()
     return {"sources": srcs, "total": tot, "days": days, "messages": msgs,
-            "uncovered": UNCOVERED, "examples": example_terms(con),
+            "uncovered": UNCOVERED, "unrecognized": UNRECOGNIZED,
+            "examples": example_terms(con),
             "last_refresh": float(last["v"]) if last else None}
 
 
@@ -1551,8 +1738,10 @@ const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').rep
  .replace(/"/g,'&quot;');
 let sel=new Set(), CHIPS_DONE=false, MSGS=[], META=null;
 function EX(){return (META&&META.examples&&META.examples.length)?META.examples:['报错','总结','README']}
-function unc(){const u=((META&&META.uncovered)||[]).join(' / ');
- return u?`注意：暂时读不到 <em>${esc(u)}</em> 里的记录，所以「没查到」不等于「没聊过」。`:''}
+function unc(){const m=META||{},u=(m.uncovered||[]).join(' / '),k=(m.unrecognized||[]).join(' / ');
+ let s=u?`注意：暂时读不到 <em>${esc(u)}</em> 里的记录，所以「没查到」不等于「没聊过」。`:'';
+ if(k)s+=`<br>另外自动发现了 <em>${esc(k)}</em>：像是 Agent 的数据目录，但还没有对应解析器（把这句话发给任意 AI 让它加即可）。`;
+ return s}
 function home(){
  $('out').innerHTML=`<div class="guide"><h3>四步回到那段对话</h3>
  <ol><li>在上面输入框里写<b>任何你还记得的线索</b>：一个词、一个产物文件名、一个项目名都行。</li>
