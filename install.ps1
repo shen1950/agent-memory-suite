@@ -54,25 +54,43 @@ if ($userPath -notlike "*$bin*") {
 
 # 4) 可选：桌面双击入口
 if ($DesktopShortcuts) {
+    # 注意：不要用 pythonw.exe。部分装了国产安全软件的机器上，pythonw.exe 能 listen 但
+    # 永远收不到回环连接（防火墙按程序名放行，只放行了 python.exe），双击图标看起来就像程序坏了。
+    # 这里用 wscript 以隐藏窗口方式启动 python.exe，效果相同且能被放行。
+    $vbsRun = @"
+Set s = CreateObject("WScript.Shell")
+s.CurrentDirectory = "$afDir"
+s.Run Chr(34) & "$pyExe" & Chr(34) & " -X utf8 " & Chr(34) & "$afDir\agentfind.py" & Chr(34) & " serve --no-open", 0, False
+"@
+    $vbsStop = @"
+Set s = CreateObject("WScript.Shell")
+s.Run Chr(34) & "$pyExe" & Chr(34) & " -X utf8 " & Chr(34) & "$afDir\agentfind.py" & Chr(34) & " --stop", 0, False
+"@
+    $runVbs = Join-Path $afDir 'start-hidden.vbs'
+    $stopVbs = Join-Path $afDir 'stop.vbs'
+    [System.IO.File]::WriteAllText($runVbs, $vbsRun, [System.Text.Encoding]::Unicode)
+    [System.IO.File]::WriteAllText($stopVbs, $vbsStop, [System.Text.Encoding]::Unicode)
+
     $ws = New-Object -ComObject WScript.Shell
     $desk = [Environment]::GetFolderPath('Desktop')
+    $icon = Join-Path $afDir 'agentfind.ico'
 
     $lnk = $ws.CreateShortcut((Join-Path $desk '找 AI 对话.lnk'))
-    $lnk.TargetPath = $pyw
-    $lnk.Arguments = '"' + (Join-Path $afDir 'agentfind.py') + '" serve'
-    $lnk.IconLocation = (Join-Path $afDir 'agentfind.ico') + ',0'
+    $lnk.TargetPath = "$env:SystemRoot\System32\wscript.exe"
+    $lnk.Arguments = "$q$runVbs$q"
+    $lnk.IconLocation = "$icon,0"
     $lnk.WorkingDirectory = $afDir
     $lnk.Description = '跨 Agent 对话检索（无命令行窗口）'
     $lnk.Save()
 
     $lnk2 = $ws.CreateShortcut((Join-Path $desk '关闭找 AI 对话.lnk'))
-    $lnk2.TargetPath = $pyExe
-    $lnk2.Arguments = '"' + (Join-Path $afDir 'agentfind.py') + '" --stop'
-    $lnk2.IconLocation = (Join-Path $afDir 'agentfind.ico') + ',0'
+    $lnk2.TargetPath = "$env:SystemRoot\System32\wscript.exe"
+    $lnk2.Arguments = "$q$stopVbs$q"
+    $lnk2.IconLocation = "$icon,0"
     $lnk2.WorkingDirectory = $afDir
     $lnk2.Description = '停止检索服务，索引保留'
     $lnk2.Save()
-    Write-Host '已在桌面创建「找 AI 对话 / 关闭找 AI 对话」'
+    Write-Host '已在桌面创建「找 AI 对话 / 关闭找 AI 对话」（wscript 隐藏窗口启动 python.exe）'
 }
 
 Write-Host ''

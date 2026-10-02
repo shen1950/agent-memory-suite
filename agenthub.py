@@ -27,7 +27,7 @@ import sys
 import time
 from pathlib import Path
 from urllib.parse import quote
-from urllib.request import urlopen
+from urllib.request import build_opener, ProxyHandler
 
 HOME = Path.home()
 APP_DIR = HOME / ".agenthub"
@@ -303,7 +303,8 @@ def agentfind_trail(query, limit=2):
         pass
     try:
         url = f"{AGENTFIND}/api/search?q={quote(query)}&limit={limit}"
-        with urlopen(url, timeout=1.2) as r:
+        opener = build_opener(ProxyHandler({}))   # 走系统代理会把 localhost 请求丢给代理并挂住
+        with opener.open(url, timeout=1.2) as r:
             res = (json.loads(r.read().decode("utf-8")).get("results") or [])[:limit]
     except Exception:
         try:

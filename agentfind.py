@@ -32,7 +32,15 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
-from urllib.request import urlopen
+from urllib.request import build_opener, ProxyHandler
+
+# 自己调自己的 127.0.0.1 接口必须绕过系统代理：Windows 上 urllib 不认 ProxyOverride 里的
+# "127.*"/"<local>"，开着 Clash 这类本地代理时请求会被丢给代理，直接挂住或误判"服务已在运行"。
+LOCAL_OPENER = build_opener(ProxyHandler({}))
+
+
+def local_open(url, timeout=60):
+    return LOCAL_OPENER.open(url, timeout=timeout)
 
 HOME = Path.home()
 APP_DIR = Path(os.environ.get("AGENTFIND_HOME") or (HOME / ".agentfind"))
@@ -62,7 +70,7 @@ def attach_log():
 def already_running(port):
     """本机端口上已有 AgentFind 在跑就返回 True（避免重复启动去抢同一个端口）。"""
     try:
-        with urlopen(f"http://127.0.0.1:{port}/api/meta", timeout=1.2) as r:
+        with local_open(f"http://127.0.0.1:{port}/api/meta", timeout=1.2) as r:
             return "total" in json.loads(r.read().decode("utf-8"))
     except Exception:
         return False
@@ -330,12 +338,18 @@ AGENTISH = re.compile(
 UNRECOGNIZED = []                       # 每次 discover_sources() 重建
 _AUTO = {"t": 0.0, "sources": [], "unknown": []}
 AUTO_TTL = 600                          # 秒：装软件不是高频事件，10 分钟内复用嗅探结果
+AUTO_BUDGET = 6.0                       # 秒：一次发现最多花这么久，绝不拖住启动
 
 
 def sniff_db_kind(f: Path):
-    """看 sqlite 里的表集合判断它属于哪种格式家族，完全不认产品名。"""
+    """看 sqlite 里的表集合判断它属于哪种格式家族，完全不认产品名。
+
+    必须 immutable + timeout=0：候选库里常有别的产品正锁着的，默认超时会让一次嗅探
+    卡好几秒；这里只要表名，读不到就跳过，不影响正确性。
+    """
     try:
-        con = sqlite3.connect(f.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
+        con = sqlite3.connect(f.resolve().as_uri() + "?mode=ro&immutable=1",
+                              uri=True, timeout=0)
         names = {r[0] for r in con.execute(
             "select name from sqlite_master where type='table'")}
         con.close()
@@ -380,12 +394,17 @@ def _autodiscover(known_paths, known_tokens):
     if time.time() - _AUTO["t"] < AUTO_TTL:
         return _AUTO["sources"], _AUTO["unknown"]
     found, unknown = [], []
+    deadline = time.time() + AUTO_BUDGET
+    sniffed, timed_out = 0, False
     for base in (HOME, Path(os.environ.get("APPDATA", ""))):
         try:
             entries = sorted(e for e in base.iterdir() if e.is_dir())
         except OSError:
             continue
         for e in entries:
+            if time.time() > deadline or sniffed > 80:
+                timed_out = True
+                break
             if e.name in SCAN_SKIP or e.name in (".", ".."):
                 continue
             if any(len(t) >= 4 and (t in _token(e.name) or _token(e.name) in t)
@@ -408,10 +427,14 @@ def _autodiscover(known_paths, known_tokens):
                 hit = "dsh_jsonl_zst"
             if not hit:
                 for db in _bounded(e, DB_GLOBS, 24):
+                    sniffed += 1
                     kind = sniff_db_kind(db)
                     if kind:
                         found.append((e.name, pretty(e.name), kind, [db]))
                         hit = kind
+                        break
+                    if sniffed > 80 or time.time() > deadline:
+                        timed_out = True
                         break
             if hit:
                 known_tokens.add(_token(e.name))
@@ -420,7 +443,8 @@ def _autodiscover(known_paths, known_tokens):
             if _bounded(e, ("*.db", "*/*.db", "db/*.db"), 1) or _bounded(e, CHAT_GLOBS, 1) \
                     or (e / "IndexedDB").is_dir() or (e / "Local Storage" / "leveldb").is_dir():
                 unknown.append(e.name.lstrip("."))
-    _AUTO.update(t=time.time(), sources=found, unknown=sorted(set(unknown))[:10])
+    _AUTO.update(sources=found, unknown=sorted(set(unknown))[:10],
+                 t=time.time() - (AUTO_TTL - 60) if timed_out else time.time())
     return _AUTO["sources"], _AUTO["unknown"]
 
 
@@ -1888,7 +1912,7 @@ setInterval(()=>{meta().catch(()=>{})},20000);
 # --------------------------------------------------------------------------
 
 def _http_json(path, port):
-    with urlopen(f"http://127.0.0.1:{port}{path}", timeout=180) as r:
+    with local_open(f"http://127.0.0.1:{port}{path}", timeout=180) as r:
         return json.loads(r.read().decode("utf-8"))
 
 

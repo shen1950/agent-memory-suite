@@ -126,3 +126,25 @@ TraeWork 把会话摘要存在 `~/.trae-cn/memory/projects/<slug>/...`，slug �
    但没有任何解析器命中的目录，会进 `UNRECOGNIZED`，由 `/api/meta` 带给首页：
    "另外自动发现了 X / Y：像是 Agent 的数据目录，但还没有对应解析器"。
    这样新装 Agent 最多是"看得见待补"，而不是"查不到还以为是自己的问题"。上限 10 个，避免刷屏。
+
+## 15. 两个"看起来程序坏了"的环境坑（v1.3.1）
+
+现象都一样：服务在跑、端口在 Listen、浏览器却打不开。排查手法是**同一份代码换解释器 / 换端口做矩阵对照**，
+比读代码快得多。
+
+1. **`pythonw.exe` 能 listen 但收不到回环连接**。装了按程序名放行入站的国产安全软件时，防火墙只放行了
+   `python.exe`；`pythonw.exe` 的监听 socket 存在，但 SYN 无人应答。用 15 行标准库
+   `ThreadingHTTPServer` 复现：pythonw 起的连不上、python.exe 起的正常，与本项目代码无关。
+   **修法：桌面快捷方式改为 `wscript.exe` 跑一段 VBS，以隐藏窗口启动 `python.exe`**
+   （`install.ps1 -DesktopShortcuts` 会生成 `~/.agentfind/start-hidden.vbs` 和 `stop.vbs`；
+   VBS 用 UTF-16LE 写，路径一律用 `Chr(34)` 拼接，避免转义地狱）。
+   注意 `allow_reuse_address` 会让这种情况更难发现——新实例照样"绑定成功"，只是永远收不到连接；
+   排查顺序：`Get-NetTCPConnection -LocalPort N -State Listen` 确认在听 → 再用裸 socket 试能不能连上。
+2. **`urllib` 会把 localhost 请求丢给系统代理**。Windows 上 Python 不认 `ProxyOverride` 里的
+   `127.*` / `<local>`（实测 `urllib.request.proxy_bypass('http://127.0.0.1:8765/…')` 返回 False），
+   开着 Clash 这类本地代理时，工具自调 `/api/meta`（启动探测、`--cli`/`--status`、AgentHub 的过程原文）
+   会被转发给代理，表现为挂住或误判"已有服务在运行"。**修法：所有自调用统一走
+   `build_opener(ProxyHandler({}))`。**
+
+已知遗留：启动时的后台扫描（约 10s）持有索引锁，期间 `/api/meta` 排队等待，表现为**第一次打开页面要等一下**。
+彻底解法是读路径改用临时只读连接（WAL 允许并发读），需要给 `search` / `overview` / `session_detail` 加"不持锁"分支。

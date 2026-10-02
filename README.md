@@ -78,6 +78,12 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveData # 连索引�
 
 ## 更新记录
 
+- **v1.3.1**
+  - 桌面快捷方式不再用 `pythonw.exe`：部分机器上安全软件只放行 `python.exe`，`pythonw.exe` 能监听但
+    收不到任何回环连接，双击图标看起来就像程序坏了。改为 `wscript` 隐藏窗口启动 `python.exe`，效果相同。
+  - 自调用（启动探测、`--cli`/`--status`、AgentHub 的过程原文链接）统一绕过系统代理：
+    Windows 上 Python 不认 `ProxyOverride` 的 `127.*`/`<local>`，开着 Clash 时会被丢给代理并挂住。
+  - 自动发现加了时间预算（6 秒）与嗅探上限，且不再等待被别的进程锁住的库；最坏情况不再拖住启动。
 - **v1.3.0**
   - 新装 Agent 自动收录：发现逻辑从"写死产品名单"改成按形状嗅探（jsonl 目录结构 + sqlite 表集合），
     扫 home 与 `%APPDATA%`，结果缓存 10 分钟；识别不出来的目录会在首页点名，不会静默漏。
