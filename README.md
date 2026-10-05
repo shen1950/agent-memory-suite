@@ -49,6 +49,26 @@ v1.3 起发现逻辑改成**按形状嗅探**（不再靠产品名单）：`proj
 
 **索引不到 ≠ 没聊过**：Cursor、VS Code Copilot Chat（记录在 `workspaceStorage/*/state.vscdb`）、Qoder IDE 侧边栏、以及任何加密正文库，页面首页会如实列出来。
 
+## 接入新 Agent（装了新产品之后）
+
+| 要什么 | 要不要动手 |
+|---|---|
+| 新 Agent 的**对话**能被 Find 查到 | **不用**。AgentFind 按形状自动发现（jsonl 目录结构 + sqlite 表集合），10 分钟缓存过期或重启服务即收录；形状认不出的会在首页点名 |
+| 新 Agent 的**原生记忆**进共享库 | 跑一次 `agenthub mem source scan --fix`。它按形状扫 `~/.<产品>/` 与 `%APPDATA%/<产品>/`，只登记真正没被覆盖的文件，结果写进 `~/.agenthub/sources.json`（改这个文件即生效，不用改代码） |
+| 新 Agent **读到**别人的记忆 | 三条路：① 能跑 shell 就直接 `agenthub mem search/context`（提示词里加一句即可）；② 把它的 skills 目录 junction 到 `~/.agents/skills`，自动获得 `agent-collab` 这个 skill；③ 往它的 `AGENTS.md`/`CLAUDE.md` 加一行 |
+| 卸载了某个产品 | 不用管。它的源不再命中文件，下次同步自动把它的原生记忆清出共享库（你自己写的结论保留） |
+
+```bash
+agenthub mem source scan [--fix]                  # 发现 / 一次接入
+agenthub mem source list                          # 现有源 + 各自命中文件数
+agenthub mem source add <产品> "<相对home的glob>"  # 记忆放在冷门形状时手动补
+agenthub mem source rm <产品或glob>                # 撤掉一条
+```
+
+只认这几种记忆形状：`memory|memories|awareness/**/*.md`、`projects/*/memory/*.md`、
+`automations/*/memory.md`，以及产品目录根上的 `MEMORY/AGENTS/CLAUDE/USER/IDENTITY/SOUL.md`。
+**记忆不是 markdown 的产品（sqlite / json / jsonl）同步不到**，需要为它单独写解析器。
+
 ## 跳回原对话（三档，按钮文案如实标注）
 
 | 档 | 行为 | 已实测 |
@@ -78,6 +98,13 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveData # 连索引�
 
 ## 更新记录
 
+- **v1.4.0**
+  - 原生记忆源改成配置驱动：`~/.agenthub/sources.json` 是事实源，内置清单只在第一次运行时当种子。
+    新增 `agenthub mem source list / add / rm / scan [--fix]`，接入新 Agent 不用改代码。
+  - 新增记忆目录自动发现：按形状扫 home 与 `%APPDATA%`，判重看**实际命中的文件**（已有规则的超集不会重复登记），
+    非 markdown 文件被后缀白名单挡掉。本机实测补上 4 个此前漏掉的源：TraeWork CN 的 `memory/`（13 个）、
+    Qoder CN 的 `projects/*/memory/`（50 个）、WorkBuddy 根上的 USER/IDENTITY/SOUL.md、QwenWork `awareness/` 全量，
+    共享库原生记忆 153 → 211 条。
 - **v1.3.3**
   - 两个桌面图标现在都保证"点了就有框"：`WshShell.Exec(...).StdIn.ReadAll()` 在装了国产安全软件的机器上
     会抛"错误的文件模式"（连 `cmd /c echo` 都读不出来），关闭图标的弹框那一行根本执行不到，

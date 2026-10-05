@@ -46,7 +46,10 @@
 ## 7. AgentHub 的共享记忆模型
 
 - 中心库 `~/.agenthub/memory.sqlite`：`notes`（含 agent/kind/topic/tags/src/sig）+ `notes_fts`（同款 trigram）+ `files`（增量签名）+ `dispatches`（派工留痕）。
-- 三条通路：主动写（`mem write`）、只读搬（`mem sync` 按 `SYNC_SOURCES` 的 glob 抓各产品原生记忆 md，`kind='native'`，**永不回写产品目录**）、主动读（`mem search` / `mem context -n N`）。
+- 三条通路：主动写（`mem write`）、只读搬（`mem sync` 按 `~/.agenthub/sources.json` 里的 glob 抓各产品原生记忆 md，`kind='native'`，**永不回写产品目录**）、主动读（`mem search` / `mem context -n N`）。
+- 源清单是**数据不是代码**（v1.4.0）：`BUILTIN_SOURCES` 只当首次种子，之后 `mem source add/rm/scan --fix` 直接改 json；
+  `load_sources()` 按 mtime 缓存，改完下一条命令就生效。`scan_sources()` 判重用「glob 实际命中的文件集合」而不是 glob 字符串，
+  否则 `.codex/memories/**/*.md` 这种已有规则的超集会被当成新源重复登记。
 - `mem context` 只注入 top-N，**不全量塞上下文**。这是与"项目内共享账本"式设计的根本区别：账本要求 agent 先读完全部历史才拿到当前状态，长度一涨必然互相触发循环；按查询注入 top-N 在结构上免疫这个问题。
 - 派工只接有无头模式的产品（`codex exec`、`claude -p`）；桌面产品无无头 CLI，只参与记忆共享，`agenthub agents` 会如实说明。每次派工自动写一条 dispatch 记忆并在 `~/.agenthub/dispatches/` 留全文。
 - 与 AgentFind 的闭环：`mem search` 结尾调 AgentFind 的 `/api/search`，输出 `http://127.0.0.1:8765/?sid=<source>|<id>` 形式的"过程原文"链接；AgentFind 页面支持 `?sid=` 直接弹出那场对话的阅读抽屉。AgentFind 没在服务时这段安静地不出现（失败冷却 60s，因为 Windows 连没监听的 127.0.0.1 端口不会立刻被拒，会干等到超时）。

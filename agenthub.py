@@ -44,8 +44,9 @@ CHUNK_LIMIT = 5000       # 原生记忆入库分段上限（字符）
 NOTE_CAP = 20000         # 单条记忆硬上限
 DEFAULT_TIMEOUT = 900    # 子 Agent 默认超时（秒）
 
-# 原生记忆来源：产品名 → markdown 通配（相对 home）。只读同步，不改动产品自己的文件。
-SYNC_SOURCES = [
+# 内置清单只当"第一次运行时该同步哪些"的种子；生效的是 ~/.agenthub/sources.json，
+# 接入新 Agent 改那个文件就行，不用碰代码（agenthub mem source add/scan --fix 会写它）。
+BUILTIN_SOURCES = [
     ("qoder-cn",   ".qoder-cn/memory/**/*.md"),
     ("qoder-cn",   ".qoder-cn/memories/**/*.md"),
     ("qoder",      ".qoder/memory/**/*.md"),
@@ -57,6 +58,121 @@ SYNC_SOURCES = [
     ("qwenworkcn", ".qwenworkcn/awareness/main/memory/*.md"),
     ("claude",     ".claude/CLAUDE.md"),
 ]
+SOURCES_FILE = APP_DIR / "sources.json"
+_src_cache = (0, [])
+
+
+def _seed_rows():
+    return [{"product": p, "glob": g, "enabled": True} for p, g in BUILTIN_SOURCES]
+
+
+def source_rows():
+    """sources.json 的原始条目；文件不存在时先按内置清单落一份，让配置成为唯一事实源。"""
+    if not SOURCES_FILE.exists():
+        save_source_rows(_seed_rows())
+    try:
+        data = json.loads(SOURCES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _seed_rows()
+    rows = data.get("sources") if isinstance(data, dict) else None
+    return rows if isinstance(rows, list) else _seed_rows()
+
+
+def save_source_rows(rows):
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    SOURCES_FILE.write_text(
+        json.dumps({"sources": rows}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def load_sources():
+    """[(产品名, 相对 home 的 glob)]，跳过 disabled；按 mtime 缓存，改完文件下次查询就生效。"""
+    global _src_cache
+    try:
+        mt = SOURCES_FILE.stat().st_mtime_ns
+    except OSError:
+        mt = 0
+    if mt and _src_cache[0] == mt:
+        return _src_cache[1]
+    out = []
+    for r in source_rows():
+        if not isinstance(r, dict) or r.get("enabled", True) is False:
+            continue
+        p = str(r.get("product") or "").strip()
+        g = str(r.get("glob") or "").strip()
+        if p and g:
+            out.append((p, g))
+    _src_cache = (mt, out)
+    return out
+
+
+def count_glob(pattern):
+    """glob 现在能命中几个文件——加源的时候用来当场验证，别写个查不到的规则进去。"""
+    return len(_glob_files(pattern))
+
+
+# 自动发现新 Agent 的记忆目录：只认这几种形状，避免把 skills/文档/缓存当记忆。
+# 前三个是"产品把记忆放在自己目录下一层"，中间三个是"按项目分文件夹"的嵌套形状。
+MEM_SHAPES = (
+    "memory/**/*.md", "memories/**/*.md", "awareness/**/*.md",
+    "projects/*/memory/*.md", "projects/*/memories/*.md", "automations/*/memory.md",
+)
+MEM_FILES = ("MEMORY.md", "AGENTS.md", "CLAUDE.md", "USER.md", "IDENTITY.md", "SOUL.md")
+MD_SUFFIXES = (".md", ".markdown", ".txt")
+SCAN_BUDGET = 12.0         # 秒。宁可下次再报，也不让一次查询卡住终端
+
+
+def _glob_files(pattern):
+    root = HOME / pattern.split("/")[0]
+    if not root.exists():
+        return set()
+    return {str(f) for f in HOME.glob(pattern) if f.is_file()}
+
+
+def scan_sources():
+    """扫 home 的点开头的目录 + %APPDATA%，返回还没进 sources.json 的候选记忆源。
+    判重看实际命中的文件而不是 glob 字符串——否则 .codex/memories/**/*.md 这种
+    "已有规则的超集"会被当成新源，加进去只是重复劳动。"""
+    have = {g for _, g in load_sources()}
+    covered = set()
+    for _, g in load_sources():
+        covered |= _glob_files(g)
+    roots = [HOME]
+    if os.environ.get("APPDATA"):
+        roots.append(Path(os.environ["APPDATA"]))
+    out, deadline = [], time.time() + SCAN_BUDGET
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            top = sorted(root.iterdir())
+        except OSError:
+            continue
+        for d in top:
+            if time.time() > deadline:
+                break
+            if not d.is_dir():
+                continue
+            if root == HOME and not d.name.startswith("."):
+                continue          # home 下只认 .产品 目录，别把用户自己的文件夹当 Agent
+            name = d.name.lstrip(".").strip().lower().replace(" ", "-")
+            if not name or name in ("agents", "agenthub", "agentfind"):
+                continue          # agents 是共享 skill 目录，后两个是工具自己的家
+            try:
+                rel = d.relative_to(HOME).as_posix()
+            except ValueError:
+                continue
+            cands = [f"{rel}/{f}" for f in MEM_FILES if (d / f).is_file()]
+            cands += [f"{rel}/{s}" for s in MEM_SHAPES if _glob_files(f"{rel}/{s}")]
+            for g in cands:
+                if g in have:
+                    continue
+                files = _glob_files(g)
+                new = files - covered
+                if not new:
+                    continue
+                covered |= files
+                out.append({"product": name, "glob": g, "files": len(new)})
+    return sorted(out, key=lambda r: (-r["files"], r["product"]))
 
 SCHEMA = """
 create table if not exists notes(
@@ -222,13 +338,15 @@ def chunk_text(text, limit=CHUNK_LIMIT):
 def run_sync(con):
     t0 = time.time()
     seen = {}
-    for product, pattern in SYNC_SOURCES:
+    for product, pattern in load_sources():
         root = HOME / pattern.split("/")[0]
         if not root.exists():
             continue
         for f in HOME.glob(pattern):
             if not f.is_file() or f.stat().st_size > 500_000:
                 continue
+            if f.suffix.lower() not in MD_SUFFIXES:
+                continue      # glob 写宽了也不至于把 config.toml / json 当记忆搬进来
             p = str(f)
             sig = f"{int(f.stat().st_mtime)}:{f.stat().st_size}"
             seen[p] = (product, sig)
@@ -263,6 +381,73 @@ def cmd_mem_sync(con, args):
     touch_stamp()
     print(f"同步完成：扫描 {seen} 个原生记忆文件，更新 {changed}、清理 {removed}，"
           f"当前原生记忆 {total} 条（{dur:.1f}s）")
+
+
+def _sync_now(con, quiet=False):
+    seen, changed, removed, total, dur = run_sync(con)
+    touch_stamp()
+    if not quiet:
+        print(f"  同步：扫描 {seen} 个文件，更新 {changed}、清理 {removed}，"
+              f"原生记忆 {total} 条（{dur:.1f}s）")
+
+
+def cmd_mem_source(con, args):
+    act, rows = args.source_act, source_rows()
+
+    if act == "list":
+        for r in rows:
+            g = str(r.get("glob") or "")
+            on = r.get("enabled", True) is not False
+            print(f"  {'✓' if on else '✗'} {str(r.get('product', '')):<13}{g:<48} 命中 {count_glob(g)}")
+        print(f"\n配置文件：{SOURCES_FILE}（改完即生效，不用重装修改代码）")
+        return
+
+    if act == "add":
+        g = args.glob.strip().strip('"')
+        if any(str(r.get("glob")) == g for r in rows):
+            print(f"这条规则已经在里了：{g}")
+            return
+        p = (args.product or g.split("/")[0].lstrip(".")) .strip().lower()
+        rows.append({"product": p, "glob": g, "enabled": True})
+        save_source_rows(rows)
+        n = count_glob(g)
+        print(f"已登记 {p} ← {g}（当前命中 {n} 个文件）")
+        if n:
+            _sync_now(con)
+        else:
+            print("  暂时一个都没命中：路径是相对 home 的 glob，等那个产品装好后跑 agenthub mem sync 即可。")
+        return
+
+    if act == "rm":
+        t = args.target.strip().strip('"').lower()
+        keep = [r for r in rows
+                if str(r.get("glob", "")).lower() != t and str(r.get("product", "")).lower() != t]
+        if len(keep) == len(rows):
+            print(f"没找到这条规则：{t}（先看 agenthub mem source list）")
+            return
+        save_source_rows(keep)
+        print(f"已删除 {len(rows) - len(keep)} 条规则，正在按新清单重算（该产品的原生记忆会一并清出共享库）")
+        _sync_now(con)
+        return
+
+    cands = scan_sources()
+    if not cands:
+        print("没发现未接入的记忆目录。已接入的看 agenthub mem source list")
+        return
+    print(f"发现 {len(cands)} 条还没接入的原生记忆源：\n")
+    for r in cands:
+        print(f"  {r['product']:<14}{r['glob']:<50} {r['files']} 个文件")
+    if args.source_act == "scan" and getattr(args, "fix", False):
+        have = {str(r.get("glob")) for r in rows}
+        add = [r for r in cands if r["glob"] not in have]
+        for r in add:
+            rows.append({"product": r["product"], "glob": r["glob"], "enabled": True})
+        save_source_rows(rows)
+        print(f"\n已自动接入 {len(add)} 条 → {SOURCES_FILE}")
+        _sync_now(con)
+    else:
+        print("\n一次接入全部：agenthub mem source scan --fix")
+        print("只接其中一条：  agenthub mem source add <产品名> \"<glob>\"")
 
 
 def touch_stamp():
@@ -655,6 +840,18 @@ def main():
 
     sy = msub.add_parser("sync", help="同步各产品原生记忆到共享索引（增量）")
     sy.set_defaults(fn=cmd_mem_sync)
+
+    sc = msub.add_parser("source", help="原生记忆源：list / add / rm / scan（配置存 sources.json）")
+    scs = sc.add_subparsers(dest="source_act", required=True)
+    scs.add_parser("list", help="列出现有源及各自命中文件数")
+    sa = scs.add_parser("add", help="接入一个新产品的记忆文件")
+    sa.add_argument("glob", help="相对 home 的 glob，如 .foo/memory/**/*.md")
+    sa.add_argument("--product", help="产品名，默认取 glob 的第一段")
+    sr = scs.add_parser("rm", help="删掉一条源（该产品的原生记忆同时清出共享库）")
+    sr.add_argument("target", help="glob 原文或产品名")
+    ss = scs.add_parser("scan", help="扫本机还没接入的记忆目录")
+    ss.add_argument("--fix", action="store_true", help="直接把扫到的全部写进 sources.json 并同步")
+    sc.set_defaults(fn=cmd_mem_source)
 
     st = msub.add_parser("stats", help="共享记忆构成")
     st.set_defaults(fn=cmd_mem_stats)
