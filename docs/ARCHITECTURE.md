@@ -149,8 +149,15 @@ TraeWork 把会话摘要存在 `~/.trae-cn/memory/projects/<slug>/...`，slug �
    会被转发给代理，表现为挂住或误判"已有服务在运行"。**修法：所有自调用统一走
    `build_opener(ProxyHandler({}))`。**
 
-已知遗留：启动时的后台扫描（约 10s）持有索引锁，期间 `/api/meta` 排队等待，表现为**第一次打开页面要等一下**。
-彻底解法是读路径改用临时只读连接（WAL 允许并发读），需要给 `search` / `overview` / `session_detail` 加"不持锁"分支。
+已解决（v1.6.0）：读路径不再抢写锁。库本来就是 WAL，允许"一写多读"并发，但原先所有查询都排在
+`IDX_LOCK` 后面，而首轮扫描要跑十几秒，表现就是"每次刚打开页面都卡半天"。现在：
+
+1. 八个只读函数（`search` / `recent_sessions` / `session_index` / `session_detail` / `open_session` /
+   `example_terms` / `overview` / `browse`）改用空锁 `NO_LOCK`，写路径 `refresh` / `rebuild` 仍独占 `IDX_LOCK`；
+2. HTTP 处理线程各自持有一条 `read_con()` 开的只读连接（`file:...?mode=ro`），不与写线程共用连接
+   （SQLite 一条连接跨线程并发使用是不安全的）；打不开只读连接时退回普通连接，覆盖"库刚建好/WAL 需恢复"；
+3. 扫描从"查询时顺带跑"改成**后台线程每 45 秒循环跑**，`/api/search` 只有在点「刷新索引」（`fresh=1`）时才同步扫。
+   实测：服务起来 2 秒、首轮扫描正在跑的时候查 `/api/sessions`，**19.5s → 0.042s**。
 
 ## 16. 桌面图标的反馈必须由文件而非管道传递（v1.3.3）
 

@@ -52,6 +52,21 @@ TRIGRAM_MIN = 3         # fts5 trigram 分词器要求的最短子串长度
 IDX_LOCK = threading.RLock()
 
 
+class _NoLock:
+    """读路径用的空锁。SQLite 开了 WAL，"一写多读"本来就允许并发，
+    让查询排在首轮约 20s 的扫描后面，是"每次刚打开都卡半天"的真正原因。
+    写路径（refresh / rebuild）仍然用 IDX_LOCK 独占。"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+NO_LOCK = _NoLock()
+
+
 # --------------------------------------------------------------------------
 # 运行环境
 # --------------------------------------------------------------------------
@@ -997,6 +1012,27 @@ def connect():
     return con
 
 
+_RCON = threading.local()
+
+
+def read_con():
+    """读路径专用的只读连接（每线程一条）。WAL 允许"一写多读"并发，所以后台首轮扫描
+    跑十几秒期间，页面照样能立刻出结果——不然所有查询都得排队等那把应用级锁，
+    表现就是"每次刚打开都卡半天"。"""
+    c = getattr(_RCON, "c", None)
+    if c is not None:
+        return c
+    try:
+        c = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=30,
+                            check_same_thread=False)
+    except sqlite3.Error:
+        # 库刚建好还没落盘、或 WAL 需要恢复：退回普通连接，别把页面打死
+        c = connect()
+    c.row_factory = sqlite3.Row
+    _RCON.c = c
+    return c
+
+
 def file_sig(path: Path):
     st = path.stat()
     return f"{int(st.st_mtime)}:{st.st_size}"
@@ -1202,8 +1238,22 @@ def session_json(meta, hits=0, score=0, snips=None, is_auto=False):
     }
 
 
+def session_index(con):
+    """整份会话元数据（不含消息正文）给前端做即时筛选与排序。
+    本机回环传 1MB 只要十几毫秒，比每次点标签都跑一趟数据库快得多。"""
+    with NO_LOCK:
+        rows = con.execute(
+            "select * from session order by coalesce(ended,started) desc").fetchall()
+    out = []
+    for m in rows:
+        d = session_json(m)
+        d["artifacts"] = d["artifacts"][:14]
+        out.append(d)
+    return out
+
+
 def recent_sessions(con, sources=None, day_from=None, day_to=None, limit=60,
-                    hide_auto=False):
+                    hide_auto=False, project=None):
     """没输关键词时的浏览：按时间倒序列出筛选范围内的会话，返回 (结果, 符合筛选的总数)。
     产品标签因此能单独当筛选器用——想只看某个 Agent 的历史，点标签就行，不必先想一个词。"""
     limit = max(1, min(limit, 300))
@@ -1219,8 +1269,11 @@ def recent_sessions(con, sources=None, day_from=None, day_to=None, limit=60,
         params.append(day_to)
     if hide_auto:
         conds.append("auto=0")
+    if project:
+        conds.append("project_name=?")
+        params.append(project)
     w = (" where " + " and ".join(conds)) if conds else ""
-    with IDX_LOCK:
+    with NO_LOCK:
         total = con.execute("select count(*) c from session" + w, params).fetchone()["c"]
         rows = con.execute("select * from session" + w
                            + " order by coalesce(ended,started) desc limit ?",
@@ -1229,12 +1282,12 @@ def recent_sessions(con, sources=None, day_from=None, day_to=None, limit=60,
 
 
 def search(con, q, sources=None, day_from=None, day_to=None, limit=60, sort="relevance",
-           hide_auto=False):
+           hide_auto=False, project=None):
     terms = split_terms(q)
     if not terms:
         return []
     limit = max(1, min(limit, 300))
-    with IDX_LOCK:
+    with NO_LOCK:
         per_term = [term_hits(con, t, sources, day_from, day_to) for t in terms]
         cand = set(per_term[0][0])
         for counts, _ in per_term[1:]:
@@ -1251,6 +1304,9 @@ def search(con, q, sources=None, day_from=None, day_to=None, limit=60, sort="rel
                     for sid in counts:
                         seen[sid] = seen.get(sid, 0) + 1
                 cand = {sid for sid, k in seen.items() if k >= 2}
+        if project:
+            cand &= {r["sid"] for r in con.execute(
+                "select sid from session where project_name=?", (project,))}
         if not cand:
             return []
         auto = {r["sid"] for r in con.execute(
@@ -1387,7 +1443,7 @@ def esc(s):
 
 
 def session_detail(con, sid):
-    with IDX_LOCK:
+    with NO_LOCK:
         meta = con.execute("select * from session where sid=?", (sid,)).fetchone()
         if not meta:
             return None
@@ -1441,7 +1497,7 @@ def reveal_file(path):
 
 def open_session(con, sid):
     """跳回原对话。只接受索引里已存在的 sid，参数一律按列表交给 CreateProcess，不拼 shell。"""
-    with IDX_LOCK:
+    with NO_LOCK:
         row = con.execute("select source, project, src_file from session where sid=?",
                           (sid,)).fetchone()
     if row is None:
@@ -1483,7 +1539,7 @@ def example_terms(con):
 
     不能把话题写死在代码里——那等于把使用者的私人上下文印在源码上。
     """
-    with IDX_LOCK:
+    with NO_LOCK:
         projs = [r["p"].strip() for r in con.execute(
             "select project_name p from session where project_name<>'' "
             "and project_name<>'(未知项目)' group by p "
@@ -1518,7 +1574,7 @@ def example_terms(con):
 
 
 def overview(con):
-    with IDX_LOCK:
+    with NO_LOCK:
         srcs = [dict(r) for r in con.execute(
             "select source,label,count(*) n,max(ended) b from session "
             "group by source order by n desc")]
@@ -1533,7 +1589,7 @@ def overview(con):
 
 
 def browse(con):
-    with IDX_LOCK:
+    with NO_LOCK:
         rows = con.execute(
             "select sid,label,source,title,project_name,n_msg,started,day from session "
             "order by coalesce(ended,started) desc limit 400").fetchall()
@@ -1550,8 +1606,8 @@ def browse(con):
 # 服务
 # --------------------------------------------------------------------------
 
-STATE = {"progress": "正在扫描本机 Agent 记录…", "ready": False, "next_scan": 0.0}
-REFRESH_MIN_INTERVAL = 45     # 秒；全量扫描一次约 3s，避免每次检索都重扫
+STATE = {"progress": "正在扫描本机 Agent 记录…", "ready": False, "last_scan": 0.0}
+REFRESH_MIN_INTERVAL = 45     # 秒。扫描在后台线程循环跑，查询请求永远只读索引，不陪它等
 
 
 def serve(port, open_browser, initial_query):
@@ -1564,19 +1620,22 @@ def serve(port, open_browser, initial_query):
             webbrowser.open(url)
         return
 
-    sources = discover_sources()
     con = connect()
 
     def worker():
-        try:
-            stats = refresh(con, sources, log=print)
-            STATE["progress"] = (f"索引已就绪：新增 {stats['new']}、更新 {stats['updated']} 个记录文件")
-            STATE["next_scan"] = time.time() + REFRESH_MIN_INTERVAL
-        except Exception as e:
-            STATE["progress"] = f"索引失败：{type(e).__name__}: {e}"
-            print(STATE["progress"])
-        finally:
+        first = True
+        while True:
+            try:
+                # 每轮重新发现一次源：新装/卸载的 Agent 就是这么被跟上的（discover 自带 10 分钟缓存）
+                stats = refresh(con, discover_sources(), log=print if first else None)
+                STATE["progress"] = (f"索引已就绪：新增 {stats['new']}、更新 {stats['updated']} 个记录文件")
+            except Exception as e:
+                STATE["progress"] = f"索引失败：{type(e).__name__}: {e}"
+                print(STATE["progress"])
             STATE["ready"] = True
+            STATE["last_scan"] = time.time()
+            first = False
+            time.sleep(REFRESH_MIN_INTERVAL)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1605,33 +1664,37 @@ def serve(port, open_browser, initial_query):
                 if u.path in ("/", "/index.html"):
                     self._send(PAGE.encode("utf-8"), "text/html; charset=utf-8")
                 elif u.path == "/api/meta":
-                    ov = overview(con)
+                    ov = overview(read_con())
                     ov.update(progress=STATE["progress"], ready=STATE["ready"])
                     self._json(ov)
+                elif u.path == "/api/sessions":
+                    self._json({"sessions": session_index(read_con()), "last_scan": STATE["last_scan"],
+                                "progress": STATE["progress"], "ready": STATE["ready"]})
                 elif u.path == "/api/search":
+                    # 只有显式点「刷新索引」才同步扫描；平时后台线程在刷，查询一律只读索引
                     forced = q.get("fresh") == "1"
-                    scanned = forced or time.time() >= STATE["next_scan"]
-                    if scanned:
-                        refresh(con, sources, force=False)
-                        STATE["next_scan"] = time.time() + REFRESH_MIN_INTERVAL
+                    if forced:
+                        refresh(con, discover_sources(), force=False)
+                        STATE["last_scan"] = time.time()
                     srcs = [s for s in q.get("sources", "").split(",") if s] or None
                     kw = (q.get("q") or "").strip()
                     flt = dict(sources=srcs, day_from=q.get("from") or None,
-                               day_to=q.get("to") or None,
+                               day_to=q.get("to") or None, project=q.get("project") or None,
                                limit=min(int(q.get("limit", 60)), 300),
                                hide_auto=q.get("auto") == "0")
                     if kw:
-                        res = search(con, kw, sort=q.get("sort", "relevance"), **flt)
+                        res = search(read_con(), kw, sort=q.get("sort", "relevance"), **flt)
                         total, browsing = None, False
                     else:
-                        res, total = recent_sessions(con, **flt)
+                        res, total = recent_sessions(read_con(), **flt)
                         browsing = True
                     self._json({"results": res, "total": total, "browse": browsing,
-                                "progress": STATE["progress"], "scanned": scanned})
+                                "progress": STATE["progress"], "scanned": forced,
+                                "last_scan": STATE["last_scan"]})
                 elif u.path == "/api/session":
-                    self._json(session_detail(con, q.get("id", "")) or {"error": "会话不在索引中"})
+                    self._json(session_detail(read_con(), q.get("id", "")) or {"error": "会话不在索引中"})
                 elif u.path == "/api/browse":
-                    self._json({"days": browse(con)})
+                    self._json({"days": browse(read_con())})
                 else:
                     self._json({"error": "not found"}, 404)
             except Exception as e:
@@ -1650,7 +1713,7 @@ def serve(port, open_browser, initial_query):
             try:
                 n = min(int(self.headers.get("Content-Length") or 0), 4096)
                 sid = str(json.loads(self.rfile.read(n).decode("utf-8") or "{}").get("sid", ""))[:200]
-                self._json(open_session(con, sid))
+                self._json(open_session(read_con(), sid))
             except Exception as e:
                 self._json({"error": f"{type(e).__name__}: {e}"}, 500)
 
@@ -1751,6 +1814,20 @@ select{border:1px solid var(--line);border-radius:5px;padding:4px 6px;font-size:
 .meta b{color:var(--mid)}
 .empty{padding:46px 0;text-align:center;color:var(--mute)}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:10px}
+/* 表格视图：按列排序、看条数、比大小 */
+.twrap{overflow:auto;border:1px solid var(--line);border-radius:8px;max-height:78vh}
+table.tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+.tbl th{position:sticky;top:0;background:var(--bg);text-align:left;padding:7px 9px;
+ border-bottom:1px solid var(--line);white-space:nowrap;color:var(--mid);cursor:pointer;
+ user-select:none}
+.tbl th:hover,.tbl th.on{color:var(--red)}
+.tbl th i{font-style:normal;margin-left:3px;font-size:10px}
+.tbl td{padding:6px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+.tbl tr:hover td{background:var(--bg)}
+.tbl .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--mid)}
+.tbl .ell{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.au{font-size:10px;color:var(--mute);border:1px solid var(--line);border-radius:3px;
+ padding:0 3px;margin-left:4px}
 .day{margin:18px 0 6px;font-size:13px;font-weight:700;color:var(--mid);
  border-bottom:1px solid var(--line);padding-bottom:4px}
 .guide{background:#fff;border:1px solid var(--line);border-radius:8px;padding:18px 22px;margin:6px 0}
@@ -1780,13 +1857,16 @@ select{border:1px solid var(--line);border-radius:5px;padding:4px 6px;font-size:
   <button onclick="go()">查找</button>
   <button class="ghost" onclick="go(1)">刷新索引</button>
   <button class="ghost" onclick="browse()">时间线</button>
+  <button class="ghost" id="vbtn" onclick="flip()" title="卡片适合读，表格适合按列排序、看条数、比大小">表格视图</button>
  </div>
  <div class="filters">
   <span style="color:#64748B">产品</span><span id="chips"></span>
+  <span style="color:#64748B;margin-left:6px">项目</span>
+  <select id="proj" onchange="apply()"><option value="">全部项目</option></select>
   <span style="color:#64748B;margin-left:6px">日期</span>
-  <input type="date" id="from"><span>→</span><input type="date" id="to">
+  <input type="date" id="from" onchange="apply()"><span>→</span><input type="date" id="to" onchange="apply()">
   <span class="chip" id="noauto" title="产品自己跑的自动任务（记忆整理等）一场里没有你的提问，默认降权排在后面，勾上则完全不看"
-   onclick="this.classList.toggle('on');if($('q').value.trim())go()">隐藏自动任务</span>
+   onclick="this.classList.toggle('on');apply()">隐藏自动任务</span>
   <span class="status" id="status"></span>
  </div>
 </div>
@@ -1816,7 +1896,8 @@ function home(){
  <div class="note">上面几个词是你本机真聊过的话题，点一下就知道是在哪个产品里聊的。<br>${unc()}</div></div>`}
 function ex(q){$('q').value=q;go()}
 function clearF(){sel.clear();[...document.querySelectorAll('.chip.on')].forEach(c=>c.classList.remove('on'));
- $('from').value='';$('to').value='';go()}
+ $('from').value='';$('to').value='';$('proj').value='';$('noauto').classList.remove('on');
+ const q=$('q').value.trim();q?go():filt()}
 function toast(t){const x=$('toast');x.textContent=t;x.classList.add('on');
  setTimeout(()=>x.classList.remove('on'),t.length>36?4200:1700)}
 async function j(u){const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json()}
@@ -1843,7 +1924,95 @@ function fmt(ts){if(!ts)return '时间未知';const d=new Date(ts*1000),p=n=>Str
  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`}
 function tgl(el){const s=el.dataset.s;
  if(sel.has(s)){sel.delete(s);el.classList.remove('on')}else{sel.add(s);el.classList.add('on')}
- go()}
+ projFill();apply()}
+/* ---- 客户端筛选：会话元数据一次拉到浏览器，点标签 / 选项目 / 改日期都不再走网络 ---- */
+let ALL=null,VIEW='card',SJ='t',SUP=false,LAST=[],REQ=0;
+const tkey=x=>x.ended||x.started||0;
+const sval=x=>SJ==='n'?x.n_msg:SJ==='p'?(x.project_name||''):SJ==='l'?x.label:tkey(x);
+async function loadIdx(){const d=await j('/api/sessions');ALL=d.sessions||[];projFill()}
+function projFill(){
+ const s=$('proj');if(!s||!ALL)return;
+ const c={};
+ for(const x of ALL)if(!sel.size||sel.has(x.source))c[x.project_name]=(c[x.project_name]||0)+1;
+ const top=Object.keys(c).filter(k=>k).sort((a,b)=>c[b]-c[a]).slice(0,120);
+ const cur=s.value;
+ s.innerHTML='<option value="">全部项目</option>'
+  +top.map(k=>`<option value="${esc(k)}">${esc(k.slice(0,26))} (${c[k]})</option>`).join('');
+ if(top.includes(cur))s.value=cur;
+}
+function picked(){
+ let a=ALL.filter(x=>!sel.size||sel.has(x.source));
+ const f=$('from').value,g=$('to').value,p=$('proj').value;
+ if(f)a=a.filter(x=>(x.day||'')>=f);
+ if(g)a=a.filter(x=>(x.day||'')<=g);
+ if(p)a=a.filter(x=>x.project_name===p);
+ if($('noauto').classList.contains('on'))a=a.filter(x=>!x.auto);
+ return a.sort((x,y)=>{const A=sval(x),B=sval(y);
+  return SUP?(A>B?1:A<B?-1:0):(A<B?1:A>B?-1:0)});
+}
+const lbls=()=>[...sel].map(s=>((META.sources||[]).find(x=>x.source===s)||{}).label||s).join('、');
+// 框里有词 → 交给服务端全文检索；没词 → 本地筛，可任意多选、毫秒出结果
+function apply(){if($('q').value.trim())go();else filt()}
+function filt(){
+ if(!ALL){loadIdx().then(filt);return}
+ LAST=picked();
+ history.replaceState(null,'','?');
+ const cap=VIEW==='table'?400:120,n=LAST.length;
+ $('status').textContent=`${sel.size?`只看 ${lbls()}`:($('proj').value?`项目 ${$('proj').value}`:'全部')}`
+  +` · ${n} 场对话`+(n>cap?` · 显示前 ${cap} 场，再输个词继续缩`:'')+' · 本地筛选，不用等';
+ paint();
+}
+function paint(){
+ const cap=VIEW==='table'?400:120;
+ const list=LAST.slice(0,cap);
+ $('out').innerHTML=list.length?(VIEW==='table'?tableOf(list):list.map(card).join('')):guide0();
+}
+function guide0(){return `<div class="guide"><h3>这个筛选条件下没有记录</h3>
+ <ol><li>再点一下产品标签取消选中，或点「去掉全部筛选」。</li><li>放宽日期：清空两边的日期框。</li>
+  <li>「隐藏自动任务」开着时，产品自己跑的会话不会显示。</li></ol>
+ <div class="row" style="margin-top:13px"><button onclick="clearF()">去掉全部筛选</button>
+  <button class="ghost" onclick="home()">回首页</button></div></div>`}
+function setsort(k){if(SJ===k)SUP=!SUP;else{SJ=k;SUP=(k==='p'||k==='l')}
+ if(ALL){LAST=picked();paint()}}
+function flip(){VIEW=VIEW==='card'?'table':'card';
+ $('vbtn').textContent=VIEW==='card'?'表格视图':'卡片视图';paint()}
+function tableOf(list){
+ const th=(k,t,cl)=>`<th class="${cl||''}${SJ===k?' on':''}" onclick="setsort('${k}')" `
+  +`title="点一下按这列排序，再点反向">${t}<i>${SJ===k?(SUP?'▲':'▼'):''}</i></th>`;
+ return `<div class="twrap"><table class="tbl"><thead><tr>`
+  +th('t','时间')+th('l','产品')+th('n','消息数')+th('p','项目')
+  +`<th>标题（点开看原文）</th><th></th></tr></thead><tbody>`
+  +list.map(x=>`<tr><td class="num">${fmt(x.started).slice(0,10)}</td>`
+   +`<td>${esc(x.label)}${x.auto?'<span class="au">自动</span>':''}</td><td class="num">${x.n_msg}</td>`
+   +`<td class="ell" title="${esc(x.project||x.project_name||'')}">${esc(x.project_name||'')}</td>`
+   +`<td class="ell"><span class="lnk" onclick="openS('${esc(x.sid)}')">${esc(x.title||'(无标题)')}</span></td>`
+   +`<td><button class="go" data-sid="${esc(x.sid)}" data-lv="${x.open_level||'file'}" `
+   +`title="${LVL[x.open_level||'file'][1]}" onclick="jump(this)">${LVL[x.open_level||'file'][0]}</button></td></tr>`).join('')
+  +'</tbody></table></div>';
+}
+async function go(fresh){
+ const q=$('q').value.trim();
+ const any=sel.size||$('from').value||$('to').value||$('proj').value
+  ||$('noauto').classList.contains('on');
+ if(!q&&!any){home();return}          // 没输线索也没选筛选 → 回首页，别给个空白页
+ if(!q){filt();return}
+ const me=++REQ;
+ history.replaceState(null,'','?q='+encodeURIComponent(q));
+ $('status').textContent=fresh?'重建索引中，稍等…':'检索中…';
+ const p=new URLSearchParams({q,sort:$('sort').value,fresh:fresh?'1':'0'});
+ if(sel.size)p.set('sources',[...sel].join(','));
+ if($('from').value)p.set('from',$('from').value);
+ if($('to').value)p.set('to',$('to').value);
+ if($('proj').value)p.set('project',$('proj').value);
+ if($('noauto').classList.contains('on'))p.set('auto','0');
+ let r;try{r=await j('/api/search?'+p)}catch(e){$('status').textContent='检索失败：服务可能已被关闭，重新双击桌面图标即可';return}
+ if(me!==REQ)return;              // 连点之后旧请求才回来，别让它盖掉新结果
+ if(r.error){$('status').textContent='出错了：'+r.error;return}
+ LAST=r.results;
+ $('status').textContent=`找到 ${r.results.length} 场对话${r.scanned?' · 已扫描过新记录':''}`;
+ if(!r.results.length){$('out').innerHTML=guideQ(q);return}
+ paint();
+}
 async function meta(){
  const m=await j('/api/meta'); META=m;
  $('sub').innerHTML=`本机已收录 <b>${m.total}</b> 场对话、<b>${m.messages.toLocaleString()}</b> 条消息`
@@ -1854,39 +2023,13 @@ async function meta(){
   CHIPS_DONE=true}
  if(!$('q').value&&m.progress)$('status').textContent=m.progress;
 }
-async function go(fresh){
- const q=$('q').value.trim();
- const picked=sel.size||$('from').value||$('to').value||$('noauto').classList.contains('on');
- if(!q&&!picked){home();return}          // 没输线索也没选筛选 → 回首页，别给个空白页
- history.replaceState(null,'',q?'?q='+encodeURIComponent(q):'?');
- $('status').textContent=fresh?'重建索引中，稍等…':(q?'检索中…':'载入中…');
- const p=new URLSearchParams({q,sort:q?$('sort').value:'time',fresh:fresh?'1':'0'});
- if(sel.size)p.set('sources',[...sel].join(','));
- if($('from').value)p.set('from',$('from').value);
- if($('to').value)p.set('to',$('to').value);
- if($('noauto').classList.contains('on'))p.set('auto','0');
- let r; try{r=await j('/api/search?'+p)}catch(e){$('status').textContent='检索失败：服务可能已被关闭，重新双击桌面图标即可';return}
- if(r.error){$('status').textContent='出错了：'+r.error;return}
- const scan=r.scanned?' · 已扫描过新记录':'';
- if(r.browse){
-  const lbl=[...sel].map(s=>((META.sources||[]).find(x=>x.source===s)||{}).label||s).join('、');
-  $('status').textContent=(lbl?`只看 ${lbl} · `:'全部 · ')
-   +`最近 ${r.results.length} 场对话（共 ${r.total} 场，按时间从新到旧）`+scan;
- }else $('status').textContent=`找到 ${r.results.length} 场对话${scan}`;
- if(!r.results.length){$('out').innerHTML=r.browse?`<div class="guide"><h3>这个筛选条件下没有记录</h3>
-  <ol><li>换个产品标签，或再点一下当前标签取消选中。</li><li>放宽日期：清空两边的日期框。</li>
-   <li>「隐藏自动任务」开着时，产品自己跑的会话不会显示。</li></ol>
-  <div class="row" style="margin-top:13px"><button onclick="clearF()">去掉全部筛选</button>
-   <button class="ghost" onclick="home()">回首页</button></div></div>`
-  :`<div class="guide"><h3>这场没查到，多半是线索太长</h3>
+function guideQ(q){return `<div class="guide"><h3>这场没查到，多半是线索太长</h3>
   <ol><li>词缩短：「季度报告整理」→ 只写「报告」。</li>
    <li>换一类线索：产物文件名（如 答辩稿.docx）、项目名片段、或你记得的一句原话。</li>
-   <li>去掉上面的产品 / 日期筛选再查一次（筛选还留着时会一直限定范围）。</li></ol>
+   <li>去掉上面的产品 / 项目 / 日期筛选再查一次（筛选还留着时会一直限定范围）。</li></ol>
   <div class="row" style="margin-top:13px"><button onclick="clearF()">去掉筛选，重查「${esc(q)}」</button>
    <button class="ghost" onclick="home()">回首页</button></div>
-  <div class="note">${unc()}</div></div>`;return}
- $('out').innerHTML=r.results.map(card).join('');
-}
+  <div class="note">${unc()}</div></div>`}
 function card(x){
  const arts=(x.artifacts||[]).slice(0,14);
  const when=fmt(x.started)+(x.ended&&x.ended!==x.started?' → '+fmt(x.ended):'');
@@ -1948,7 +2091,9 @@ async function cp(t){try{await navigator.clipboard.writeText(t);toast('已复制
 $('q').addEventListener('keydown',ev=>{if(ev.key==='Enter')go()});
 document.addEventListener('keydown',ev=>{if(ev.key==='Escape')closeD()});
 setInterval(()=>{meta().catch(()=>{})},20000);
+setInterval(()=>{if(ALL&&!$('q').value.trim())loadIdx().catch(()=>{})},120000);   // 浏览时顺手补新会话
 (async()=>{await meta();
+ loadIdx().catch(()=>{});              // 预取元数据：第一次点标签就瞬时，不用等网络
  const u=new URLSearchParams(location.search);
  if(u.get('q')){$('q').value=u.get('q');go()}
  else if(u.get('sid')){home();openS(u.get('sid'))}
