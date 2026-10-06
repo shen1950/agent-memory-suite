@@ -1186,6 +1186,48 @@ def term_hits(con, term, sources, day_from, day_to):
     return counts, meta
 
 
+def session_json(meta, hits=0, score=0, snips=None, is_auto=False):
+    """session 行 → 前端卡片要的字段；检索和浏览两条路共用这一份。"""
+    return {
+        "sid": meta["sid"], "label": meta["label"], "source": meta["source"],
+        "title": meta["title"], "project": meta["project"],
+        "project_name": meta["project_name"], "started": meta["started"],
+        "ended": meta["ended"], "day": meta["day"], "n_msg": meta["n_msg"],
+        "models": [m for m in (meta["models"] or "").split(",") if m],
+        "branch": meta["branch"], "src_file": meta["src_file"],
+        "artifacts": [a for a in (meta["artifacts"] or "").split("\n") if a],
+        "hits": hits, "score": score, "snippets": snips or [],
+        "open_level": opener_for(meta["source"])["level"],
+        "auto": 1 if is_auto else 0,
+    }
+
+
+def recent_sessions(con, sources=None, day_from=None, day_to=None, limit=60,
+                    hide_auto=False):
+    """没输关键词时的浏览：按时间倒序列出筛选范围内的会话，返回 (结果, 符合筛选的总数)。
+    产品标签因此能单独当筛选器用——想只看某个 Agent 的历史，点标签就行，不必先想一个词。"""
+    limit = max(1, min(limit, 300))
+    conds, params = [], []
+    if sources:
+        conds.append("source in (%s)" % ",".join("?" * len(sources)))
+        params += list(sources)
+    if day_from:
+        conds.append("day>=?")
+        params.append(day_from)
+    if day_to:
+        conds.append("day<=?")
+        params.append(day_to)
+    if hide_auto:
+        conds.append("auto=0")
+    w = (" where " + " and ".join(conds)) if conds else ""
+    with IDX_LOCK:
+        total = con.execute("select count(*) c from session" + w, params).fetchone()["c"]
+        rows = con.execute("select * from session" + w
+                           + " order by coalesce(ended,started) desc limit ?",
+                           (*params, limit)).fetchall()
+    return [session_json(r) for r in rows], total
+
+
 def search(con, q, sources=None, day_from=None, day_to=None, limit=60, sort="relevance",
            hide_auto=False):
     terms = split_terms(q)
@@ -1247,18 +1289,7 @@ def search(con, q, sources=None, day_from=None, day_to=None, limit=60, sort="rel
                 if html:
                     snips_ = [{"role": "meta", "ts": meta["ended"] or meta["started"],
                                "day": meta["day"], "html": html}]
-            results.append({
-                "sid": sid, "label": meta["label"], "source": meta["source"],
-                "title": meta["title"], "project": meta["project"],
-                "project_name": meta["project_name"], "started": meta["started"],
-                "ended": meta["ended"], "day": meta["day"], "n_msg": meta["n_msg"],
-                "models": [m for m in (meta["models"] or "").split(",") if m],
-                "branch": meta["branch"], "src_file": meta["src_file"],
-                "artifacts": [a for a in (meta["artifacts"] or "").split("\n") if a],
-                "hits": hits, "score": score, "snippets": snips_,
-                "open_level": opener_for(meta["source"])["level"],
-                "auto": 1 if sid in auto else 0,
-            })
+            results.append(session_json(meta, hits, score, snips_, sid in auto))
     if sort == "time":
         results.sort(key=lambda r: -(r["ended"] or r["started"] or 0))
     elif sort == "time_asc":
@@ -1584,11 +1615,18 @@ def serve(port, open_browser, initial_query):
                         refresh(con, sources, force=False)
                         STATE["next_scan"] = time.time() + REFRESH_MIN_INTERVAL
                     srcs = [s for s in q.get("sources", "").split(",") if s] or None
-                    self._json({"results": search(con, q.get("q", ""), srcs,
-                                                  q.get("from") or None, q.get("to") or None,
-                                                  min(int(q.get("limit", 60)), 300),
-                                                  q.get("sort", "relevance"),
-                                                  hide_auto=q.get("auto") == "0"),
+                    kw = (q.get("q") or "").strip()
+                    flt = dict(sources=srcs, day_from=q.get("from") or None,
+                               day_to=q.get("to") or None,
+                               limit=min(int(q.get("limit", 60)), 300),
+                               hide_auto=q.get("auto") == "0")
+                    if kw:
+                        res = search(con, kw, sort=q.get("sort", "relevance"), **flt)
+                        total, browsing = None, False
+                    else:
+                        res, total = recent_sessions(con, **flt)
+                        browsing = True
+                    self._json({"results": res, "total": total, "browse": browsing,
                                 "progress": STATE["progress"], "scanned": scanned})
                 elif u.path == "/api/session":
                     self._json(session_detail(con, q.get("id", "")) or {"error": "会话不在索引中"})
@@ -1772,7 +1810,8 @@ function home(){
   <li>按回车，或点「查找」。</li>
   <li>每条结果的第一行直接写着 <b>哪个产品 · 什么时候 · 哪个项目</b>；点「阅读这场对话」看完整原文。</li>
   <li>点红色的<b>跳回</b>按钮就能回到那个应用里接着聊。按钮上的字会告诉你这次能跳到哪一步：
-   直接进那场对话 / 只把应用唤到前台（会话 ID 顺手复制好）/ 在资源管理器里定位原始记录。</li></ol>
+   直接进那场对话 / 只把应用唤到前台（会话 ID 顺手复制好）/ 在资源管理器里定位原始记录。</li>
+  <li>不想输词、只想翻某个 Agent 的历史：<b>直接点上面的产品标签</b>，下面按时间列出那个产品的对话；再点一次取消。</li></ol>
  <div class="ex">${EX().map(t=>`<b data-q="${esc(t)}" onclick="ex(this.dataset.q)">${esc(t)}</b>`).join('')}</div>
  <div class="note">上面几个词是你本机真聊过的话题，点一下就知道是在哪个产品里聊的。<br>${unc()}</div></div>`}
 function ex(q){$('q').value=q;go()}
@@ -1804,7 +1843,7 @@ function fmt(ts){if(!ts)return '时间未知';const d=new Date(ts*1000),p=n=>Str
  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`}
 function tgl(el){const s=el.dataset.s;
  if(sel.has(s)){sel.delete(s);el.classList.remove('on')}else{sel.add(s);el.classList.add('on')}
- if($('q').value.trim())go()}
+ go()}
 async function meta(){
  const m=await j('/api/meta'); META=m;
  $('sub').innerHTML=`本机已收录 <b>${m.total}</b> 场对话、<b>${m.messages.toLocaleString()}</b> 条消息`
@@ -1816,18 +1855,30 @@ async function meta(){
  if(!$('q').value&&m.progress)$('status').textContent=m.progress;
 }
 async function go(fresh){
- const q=$('q').value.trim(); if(!q){toast('请输入线索');return}
- history.replaceState(null,'','?q='+encodeURIComponent(q));
- $('status').textContent=fresh?'重建索引中，稍等…':'检索中…';
- const p=new URLSearchParams({q,sort:$('sort').value,fresh:fresh?'1':'0'});
+ const q=$('q').value.trim();
+ const picked=sel.size||$('from').value||$('to').value||$('noauto').classList.contains('on');
+ if(!q&&!picked){home();return}          // 没输线索也没选筛选 → 回首页，别给个空白页
+ history.replaceState(null,'',q?'?q='+encodeURIComponent(q):'?');
+ $('status').textContent=fresh?'重建索引中，稍等…':(q?'检索中…':'载入中…');
+ const p=new URLSearchParams({q,sort:q?$('sort').value:'time',fresh:fresh?'1':'0'});
  if(sel.size)p.set('sources',[...sel].join(','));
  if($('from').value)p.set('from',$('from').value);
  if($('to').value)p.set('to',$('to').value);
  if($('noauto').classList.contains('on'))p.set('auto','0');
  let r; try{r=await j('/api/search?'+p)}catch(e){$('status').textContent='检索失败：服务可能已被关闭，重新双击桌面图标即可';return}
  if(r.error){$('status').textContent='出错了：'+r.error;return}
- $('status').textContent=`找到 ${r.results.length} 场对话${r.scanned?' · 已扫描过新记录':''}`;
- if(!r.results.length){$('out').innerHTML=`<div class="guide"><h3>这场没查到，多半是线索太长</h3>
+ const scan=r.scanned?' · 已扫描过新记录':'';
+ if(r.browse){
+  const lbl=[...sel].map(s=>((META.sources||[]).find(x=>x.source===s)||{}).label||s).join('、');
+  $('status').textContent=(lbl?`只看 ${lbl} · `:'全部 · ')
+   +`最近 ${r.results.length} 场对话（共 ${r.total} 场，按时间从新到旧）`+scan;
+ }else $('status').textContent=`找到 ${r.results.length} 场对话${scan}`;
+ if(!r.results.length){$('out').innerHTML=r.browse?`<div class="guide"><h3>这个筛选条件下没有记录</h3>
+  <ol><li>换个产品标签，或再点一下当前标签取消选中。</li><li>放宽日期：清空两边的日期框。</li>
+   <li>「隐藏自动任务」开着时，产品自己跑的会话不会显示。</li></ol>
+  <div class="row" style="margin-top:13px"><button onclick="clearF()">去掉全部筛选</button>
+   <button class="ghost" onclick="home()">回首页</button></div></div>`
+  :`<div class="guide"><h3>这场没查到，多半是线索太长</h3>
   <ol><li>词缩短：「季度报告整理」→ 只写「报告」。</li>
    <li>换一类线索：产物文件名（如 答辩稿.docx）、项目名片段、或你记得的一句原话。</li>
    <li>去掉上面的产品 / 日期筛选再查一次（筛选还留着时会一直限定范围）。</li></ol>
@@ -1841,7 +1892,7 @@ function card(x){
  const when=fmt(x.started)+(x.ended&&x.ended!==x.started?' → '+fmt(x.ended):'');
  return `<div class="card"><div class="top">
   <span class="tag">${esc(x.label)}</span>${x.auto?'<span class="tag" style="background:#fff;color:#64748B;border-color:#E2E8F0">自动任务</span>':''}<span class="when">${when}</span>
-  <span class="hits">${x.hits?`提到 ${x.hits} 次 · `:'线索在标题/项目/产物 · '}这场对话 ${x.n_msg} 条</span></div>
+  <span class="hits">${x.hits?`提到 ${x.hits} 次 · `:(x.snippets&&x.snippets.length?'线索在标题/项目/产物 · ':'')}这场对话 ${x.n_msg} 条</span></div>
  <div class="ttl">${esc(x.title)}</div>
  <div class="proj">项目 <code>${esc(x.project_name)}</code> ${esc(x.project||'')}
   ${x.branch?'· '+esc(x.branch):''}${x.models.length?'· '+esc(x.models.join('/')):''}</div>
