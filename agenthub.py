@@ -875,7 +875,10 @@ QUOTA = {
     "workbuddy": ("need_capture", "https://copilot.tencent.com/billing/meter/get-user-resource-summary",
                   None, "登录态（IPC 取，不落文件）",
                   "app.asar 里确证一整套 /billing/meter/* 与 /profile/usage；社区方案也拿不到积分"),
-    "qwenworkcn": ("none", None, None, None, "只找到 UI 标记文件，非余额"),
+    "qwenworkcn": ("need_endpoint", None, None, "Bearer <auth-v2.dat 里的 JWT>",
+                   "2026-10-08 打通凭据：%APPDATA%\QwenWorkCN\auth-v2.dat 是 v10/os_crypt，"
+                   "用与 Qoder 同一套 DPAPI+AES-GCM 直接解出，内含 app_id=qwenwork-desktop-app、"
+                   "aud=oauth_app 的 JWT 与 refreshToken；只差额度接口 URL 未知"),
     "opencode": ("need_key", None, None, "Bearer", "走各家 relay，用对应上游的接口查"),
 }
 
