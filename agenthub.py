@@ -14,6 +14,7 @@ mem search / context / list 在查之前会自动增量同步各产品原生记�
 """
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -863,10 +864,10 @@ QUOTA = {
     "zcode": ("need_capture", "https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.14.4",
               "data.balances", "Bearer <客户端凭据>",
               "日志确证客户端自己调得到 code:0；但 leveldb 里那份 JWT 打过去 400，真凭据在 credentials.json(enc:v1)"),
-    "qoder-cn": ("need_capture", "https://openapi.qoder.com.cn/api/v2/user/plan", None, "登录态",
-                 "日志 87 次 200；creditUsage 在 state.vscdb 里是 v10/DPAPI 密文，同用户可解"),
-    "qoder": ("need_capture", "https://openapi.qoder.sh/api/v2/user/plan", None, "登录态",
-              "与 CN 版同一套代码路径"),
+    "qoder-cn": ("local_read", "https://openapi.qoder.com.cn/api/v2/user/plan", None, "本地 DPAPI",
+                 "已打通：agenthub quota 直接解 state.vscdb 的 secret://aicoding.auth.creditUsage（v10/AES-GCM），不联网"),
+    "qoder": ("local_read", "https://openapi.qoder.sh/api/v2/user/plan", None, "本地 DPAPI",
+              "与 CN 版同一套代码路径，同一份实现直接读出多桶积分与到期日"),
     "trae-cn": ("need_capture", "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage", None, "登录态",
                 "日志里另有 checkin_credits/status、cn_credits_billing_status 等 4 条真实路径"),
     "workbuddy": ("need_capture", "https://copilot.tencent.com/billing/meter/get-user-resource-summary",
@@ -956,6 +957,128 @@ def cmd_catalog(con, args):
     print(f"\n生成于 {doc['updated']}，文件：{CATALOG_PATH}")
 
 
+# ---------------------------------------------------------------------------
+# 本机凭据直读：Qoder 系的积分本来就存在它自己的 state.vscdb 里（Chromium os_crypt v10）。
+# 全程只读、不联网、不解他人账号——DPAPI 主密钥只对当前 Windows 登录用户有效。
+# ---------------------------------------------------------------------------
+QODER_STORES = {"qoder-cn": "QoderCN", "qoder": "Qoder"}
+FOREVER_MS = 253402214400000      # 9999-12-31：厂商拿它当"无限期"哨兵
+
+
+def _dpapi(data):
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    src = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    out = BLOB()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(src), None, None, None, None, 0, ctypes.byref(out)):
+        raise RuntimeError("CryptUnprotectData 失败：这份凭据不是当前 Windows 用户加密的")
+    res = ctypes.create_string_buffer(out.cbData)
+    ctypes.memmove(res, out.pbData, out.cbData)
+    ctypes.windll.kernel32.LocalFree(out.pbData)
+    return res.raw
+
+
+def qoder_credit(appdata_name):
+    """返回 Qoder 自己写的 creditUsage 明文 dict；没装/没登录/缺依赖都给个说明性结果。"""
+    ad = Path(os.environ.get("APPDATA", "")) / appdata_name
+    ls, db = ad / "Local State", ad / "User" / "globalStorage" / "state.vscdb"
+    if not ls.is_file() or not db.is_file():
+        return {"error": f"没找到 {appdata_name} 的 Local State 或 state.vscdb"}
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        return {"error": "缺 cryptography 库（pip install cryptography）"}
+    try:
+        wrapped = base64.b64decode(json.loads(ls.read_text(encoding="utf-8"))["os_crypt"]["encrypted_key"])
+        key = _dpapi(wrapped[5:])                       # 前 5 字节是字面量 "DPAPI"
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = con.execute("select value from ItemTable where key=?",
+                              ("secret://aicoding.auth.creditUsage",)).fetchone()
+        finally:
+            con.close()
+        if not row:
+            return {"error": "库里没有 creditUsage（可能还没登录过）"}
+        blob = bytes(json.loads(row[0])["data"])
+        if blob[:3] != b"v10":
+            return {"error": f"不是 v10 格式（前缀 {blob[:3]!r}）"}
+        return {"data": json.loads(AESGCM(key).decrypt(blob[3:15], blob[15:], None))}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def credit_buckets(d):
+    """把积分拆成一桶一桶：主额度 / 附加包 / 每个专属资源包，各自 total-used-remaining。"""
+    out = []
+
+    def push(label, q):
+        if isinstance(q, dict) and q.get("total") is not None:
+            out.append({"pool": label, "total": q.get("total"), "used": q.get("used"),
+                        "remaining": q.get("remaining"), "unit": q.get("unit") or "credits"})
+
+    push("主额度", d.get("userQuota"))
+    push("附加包", d.get("addOnQuota"))
+    for p in d.get("dedicatedResourcePackages") or []:
+        push(f"资源包 {p.get('name') or str(p.get('id'))[:8]}", p)
+    return out
+
+
+def exp_text(ms):
+    if not ms or ms >= FOREVER_MS:
+        return "无限期"
+    return dt.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d")
+
+
+def cmd_quota(con, args):
+    want = [args.product] if args.product else list(QODER_STORES)
+    rows, dump = [], []
+    for p in want:
+        store = QODER_STORES.get(p)
+        if not store:
+            print(f"不认识的产品 {p}（支持：{'、'.join(QODER_STORES)}）")
+            continue
+        r = qoder_credit(store)
+        if "error" in r:
+            rows.append((p, None, r["error"]))
+            dump.append({"product": p, "error": r["error"]})
+            continue
+        d = r["data"]
+        buckets = credit_buckets(d)
+        left = sum(b["remaining"] or 0 for b in buckets)
+        total = sum(b["total"] or 0 for b in buckets)
+        rows.append((p, (d, buckets, left, total), None))
+        dump.append({"product": p, "userType": d.get("userType"), "left": left, "total": total,
+                     "expires": exp_text(d.get("expiresAt")), "exceeded": d.get("isQuotaExceeded"),
+                     "buckets": buckets})
+    if args.json:
+        print(json.dumps(dump, ensure_ascii=False, indent=2))
+        return
+    for p, ok, err in rows:
+        if err:
+            print(f"  {p:<12}读不到：{err}")
+            continue
+        d, buckets, left, total = ok
+        flag = "已超额" if d.get("isQuotaExceeded") else f"用了 {d.get('totalUsagePercentage', 0):.0%}"
+        print(f"  {p:<12}剩 {left}/{total} 积分 · {d.get('userType') or '?'} · 到期 {exp_text(d.get('expiresAt'))} · {flag}")
+        for b in buckets:
+            print(f"      {b['pool']:<26}{b['used']}/{b['total']} → 剩 {b['remaining']} {b['unit']}")
+    if args.write:
+        for p, ok, _ in rows:
+            if not ok:
+                continue
+            d, buckets, left, total = ok
+            line = (f"{p} 余额：剩 {left}/{total} 积分，到期 {exp_text(d.get('expiresAt'))}；"
+                    + "；".join(f"{b['pool']} 剩 {b['remaining']}/{b['total']}" for b in buckets))
+            insert_note(con, "agenthub", "fact", f"{p} 余额快照", "quota,agenthub", line)
+            print(f"  已写入共享记忆：{line[:60]}…")
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -1034,6 +1157,12 @@ def main():
     sh = cts.add_parser("show", help="列出目录里每家的记忆/余额接入状态")
     sh.add_argument("--detail", action="store_true", help="连余额端点与鉴权方式一起打印")
     ct.set_defaults(fn=cmd_catalog)
+
+    qt = sub.add_parser("quota", help="从本机直读 Qoder 系积分（DPAPI + v10/AES-GCM，只读、不联网）")
+    qt.add_argument("product", nargs="?", help="qoder-cn / qoder；省略则两个都读")
+    qt.add_argument("--json", action="store_true", help="输出机器可读的原始结构")
+    qt.add_argument("--write", action="store_true", help="把这次快照写进共享记忆，别的 Agent 也能看到")
+    qt.set_defaults(fn=cmd_quota)
 
     ca = sub.add_parser("call", help="把任务派给子 Agent 无头执行")
     ca.add_argument("product", help="codex / claude")
