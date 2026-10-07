@@ -868,8 +868,10 @@ QUOTA = {
                  "已打通：agenthub quota 直接解 state.vscdb 的 secret://aicoding.auth.creditUsage（v10/AES-GCM），不联网"),
     "qoder": ("local_read", "https://openapi.qoder.sh/api/v2/user/plan", None, "本地 DPAPI",
               "与 CN 版同一套代码路径，同一份实现直接读出多桶积分与到期日"),
-    "trae-cn": ("need_capture", "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage", None, "登录态",
-                "日志里另有 checkin_credits/status、cn_credits_billing_status 等 4 条真实路径"),
+    "trae-cn": ("need_capture", "https://api.trae.cn/trae/api/v2/ug/checkin_credits/status", None, "登录态（本机查无）",
+                "2026-10-08 实测排除本地直读：state.vscdb 无 secret:// 键；Network/Cookies 33 条全是埋点、"
+                "没有一条 .trae.cn；leveldb 与 ModularData 与 ~/.trae-cn 都扫不到会话凭据。"
+                "端点本身确凿（Cockpit Tools 二进制里就有），但凭据只能从流量里拿"),
     "workbuddy": ("need_capture", "https://copilot.tencent.com/billing/meter/get-user-resource-summary",
                   None, "登录态（IPC 取，不落文件）",
                   "app.asar 里确证一整套 /billing/meter/* 与 /profile/usage；社区方案也拿不到积分"),
