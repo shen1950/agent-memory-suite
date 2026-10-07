@@ -787,6 +787,175 @@ def cmd_log(con, args):
 
 # ---------------------------------------------------------------- 入口 ---
 
+CATALOG_PATH = HOME / ".agents" / "catalog.json"
+
+# 预存的各家 Agent 索引信息：安装位置候选、配置目录、原生记忆形状、会话记录形状、
+# 本机实测过的多开结论。三个工具共用（驾驶舱识别产品、mem source 接入记忆、AgentFind 找解析器），
+# 所以只写"本机验证过的事实"，不写猜出来的路径；额度接口留空由 agenthub catalog 之后补。
+CATALOG_SEED = [
+    {"id": "workbuddy", "name": "WorkBuddy", "vendor": "Tencent", "kind": "electron",
+     "config": ".workbuddy", "exe": ["D:/LenovoSoftstore/Install/WorkBuddy/WorkBuddy.exe"],
+     "memory": [".workbuddy/memory/*.md", ".workbuddy/MEMORY.md", ".workbuddy/USER.md",
+                ".workbuddy/IDENTITY.md", ".workbuddy/SOUL.md", ".workbuddy/automations/*/memory.md"],
+     "sessions": [], "multi_open": False,
+     "note": "第二次启动被已有窗口接管（参数被丢弃），只能整目录换号"},
+    {"id": "qoder-cn", "name": "Qoder CN", "vendor": "Alibaba", "kind": "electron",
+     "config": ".qoder-cn", "exe": ["D:/Artificial_Intelligence/Qoder CN/Qoder CN.exe"],
+     "memory": [".qoder-cn/memory/**/*.md", ".qoder-cn/memories/**/*.md",
+                ".qoder-cn/projects/*/memory/*.md"],
+     "sessions": [], "multi_open": False, "note": "单实例接管"},
+    {"id": "qoder", "name": "Qoder 国际版", "vendor": "Alibaba", "kind": "electron",
+     "config": ".qoder", "exe": ["{LOCALAPPDATA}/Programs/Qoder/Qoder.exe"],
+     "memory": [".qoder/memory/**/*.md", ".qoder/projects/*/memory/*.md"],
+     "sessions": [], "multi_open": False, "note": "与 CN 版是两个独立产品，配置目录不共用"},
+    {"id": "qoder-cn-ide", "name": "Qoder CN IDE", "vendor": "Alibaba", "kind": "electron",
+     "config": ".qoder-cn-ide", "exe": ["D:/Artificial_Intelligence/Qoder CN IDE/Qoder CN IDE.exe"],
+     "memory": [], "sessions": [], "multi_open": True, "note": "实测可 --user-data-dir 多开"},
+    {"id": "trae-cn", "name": "TraeWork CN", "vendor": "ByteDance", "kind": "electron",
+     "config": ".trae-cn", "exe": ["D:/Artificial_Intelligence/TRAE SOLO CN/TRAE SOLO CN.exe"],
+     "memory": [".trae-cn/memory/**/*.md"],
+     "sessions": [".trae-cn/memory/projects/**/session_memory_*.jsonl"],
+     "multi_open": True,
+     "note": "正文库加密，AgentFind 只能索引会话摘要；session_memory_*.jsonl 尚未接解析器"},
+    {"id": "zcode", "name": "ZCode", "vendor": "Zhipu", "kind": "electron",
+     "config": ".zcode", "exe": ["D:/Artificial_Intelligence/ZCode/ZCode.exe"],
+     "memory": [], "sessions": ["~/.zcode/cli/db/db.sqlite"], "multi_open": True,
+     "note": "memoryEnabled:false，对共享记忆是纯读者"},
+    {"id": "codex", "name": "Codex CLI", "vendor": "OpenAI", "kind": "cli",
+     "config": ".codex", "exe": ["D:/npm-global/codex.cmd"], "env": "CODEX_HOME",
+     "memory": [".codex/memories/*.md", ".codex/memories/**/*.md", ".codex/AGENTS.md"],
+     "sessions": [".codex/sessions/**/*.jsonl"], "multi_open": True,
+     "note": "⚠ 原生记忆已迁到 .codex/memories_1.sqlite，md 侧是僵尸数据"},
+    {"id": "claude", "name": "Claude Code CLI", "vendor": "Anthropic", "kind": "cli",
+     "config": ".claude", "exe": ["D:/npm-global/claude.cmd"], "env": "CLAUDE_CONFIG_DIR",
+     "memory": [".claude/CLAUDE.md"], "sessions": [".claude/projects/*/*.jsonl"],
+     "multi_open": True, "note": ""},
+    {"id": "dsh", "name": "DeepSeek DSH", "vendor": "DeepSeek", "kind": "electron",
+     "config": ".dsh", "exe": [], "memory": [],
+     "sessions": [".dsh/sessions/**/session.*.jsonl.zst*"], "multi_open": None,
+     "note": "zstd 压缩 jsonl，需 Python 3.14+ 标准库；会把注入型通知当用户消息当标题"},
+    {"id": "qwenworkcn", "name": "QwenWork CN", "vendor": "Alibaba", "kind": "electron",
+     "config": ".qwenworkcn", "exe": [],
+     "memory": [".qwenworkcn/awareness/main/MEMORY.md", ".qwenworkcn/awareness/main/memory/*.md",
+                ".qwenworkcn/awareness/**/*.md"],
+     "sessions": [], "multi_open": None, "note": "自动任务会话多，AgentFind 已按 session.auto 降权"},
+    {"id": "opencode", "name": "opencode", "vendor": "SST", "kind": "cli",
+     "config": ".config/opencode", "exe": [], "memory": [],
+     "sessions": ["~/.local/share/opencode/opencode.db"], "multi_open": None,
+     "note": "sqlite 表集合 {session,message,part}，与 ZCode 同构"},
+    {"id": "copilot", "name": "VS Code Copilot Chat", "vendor": "GitHub", "kind": "extension",
+     "config": "Code/User/globalStorage/github.copilot-chat", "exe": [], "memory": [],
+     "sessions": ["%APPDATA%/Code/User/globalStorage/github.copilot-chat/session-store.db"],
+     "multi_open": None, "note": "一行一个来回；只读打开不能带 immutable（WAL 可见性）"},
+]
+# 余额/额度接口：只写**本机日志或官方文档里确证存在**的端点，状态分四档，避免把猜的当成品。
+#   ready         有 API Key 就能直接查（官方公开）
+#   need_capture  端点确凿，但要客户端自己的登录态，得先抓包导出 token
+#   need_key      端点确凿，缺一个能用的 API Key
+#   none          本轮没找到任何证据
+QUOTA = {
+    "dsh": ("need_key", "https://api.deepseek.com/user/balance", "balance_infos",
+                     "Bearer <sk- API Key>", "官方文档；实测端点活着，用登录态 token 会 401"),
+    "codex": ("ready", "https://api.openai.com/v1/organization/costs", None,
+              "Bearer <Admin Key>", "驾驶舱已有 openai 适配器；本地只有占位 key"),
+    "claude": ("need_key", None, None, "Bearer",
+              "走 aiwelink 中转，settings.json 里有明文 sk-，用 newapi/oneapi 适配器实测 /api/user/self"),
+    "zcode": ("need_capture", "https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.14.4",
+              "data.balances", "Bearer <客户端凭据>",
+              "日志确证客户端自己调得到 code:0；但 leveldb 里那份 JWT 打过去 400，真凭据在 credentials.json(enc:v1)"),
+    "qoder-cn": ("need_capture", "https://openapi.qoder.com.cn/api/v2/user/plan", None, "登录态",
+                 "日志 87 次 200；creditUsage 在 state.vscdb 里是 v10/DPAPI 密文，同用户可解"),
+    "qoder": ("need_capture", "https://openapi.qoder.sh/api/v2/user/plan", None, "登录态",
+              "与 CN 版同一套代码路径"),
+    "trae-cn": ("need_capture", "https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage", None, "登录态",
+                "日志里另有 checkin_credits/status、cn_credits_billing_status 等 4 条真实路径"),
+    "workbuddy": ("need_capture", "https://copilot.tencent.com/billing/meter/get-user-resource-summary",
+                  None, "登录态（IPC 取，不落文件）",
+                  "app.asar 里确证一整套 /billing/meter/* 与 /profile/usage；社区方案也拿不到积分"),
+    "qwenworkcn": ("none", None, None, None, "只找到 UI 标记文件，非余额"),
+    "opencode": ("need_key", None, None, "Bearer", "走各家 relay，用对应上游的接口查"),
+}
+
+
+def _expand(p):
+    return (str(p).replace("{LOCALAPPDATA}", os.environ.get("LOCALAPPDATA", ""))
+            .replace("%APPDATA%", os.environ.get("APPDATA", "")))
+
+
+def _hits_glob(glob):
+    """目录里的形状字段允许 ~/、%APPDATA%/、相对 home 三种写法，统一判存在。"""
+    g = _expand(glob)
+    if g.startswith("~/"):
+        g = g[2:]
+    try:
+        if len(g) > 1 and g[1] == ":":                 # 已经展开成绝对路径
+            p = Path(g)
+            return p.exists() if "*" not in g else next(p.parent.glob(p.name), None) is not None
+        return next(HOME.glob(g), None) is not None    # 相对 home
+    except (OSError, ValueError):
+        return False
+
+
+def installed_probe(a):
+    """在装判断：可执行文件 / 配置目录 / 记忆或会话文件，三者命中任一即算装着。"""
+    for cand in a.get("exe") or []:
+        if Path(_expand(cand)).exists():
+            return True
+    cfg = a.get("config") or ""
+    if cfg:
+        if cfg.startswith("."):
+            if (HOME / cfg).exists():
+                return True
+        elif cfg.startswith("~"):
+            if Path(_expand(cfg)).exists():
+                return True
+        elif (Path(os.environ.get("APPDATA", "")) / cfg).exists():
+            return True
+    return any(_hits_glob(g) for g in (a.get("memory") or []) + (a.get("sessions") or []))
+
+
+def catalog_build():
+    """把内置目录 + 本机实测（哪些装着、记忆接了哪几条）合成 ~/.agents/catalog.json。"""
+    src_globs = {}
+    for product, g in load_sources():
+        src_globs.setdefault(product, []).append(g)
+    out = []
+    for a in CATALOG_SEED:
+        e = dict(a)
+        e["installed"] = installed_probe(a)
+        e["memory_synced"] = sorted(src_globs.get(a["id"], []))
+        st, url, path, auth, note = QUOTA.get(a["id"], (None, None, None, None, ""))
+        e["quota"] = {"status": st, "url": url, "path": path, "auth": auth, "evidence": note}
+        out.append(e)
+    CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    doc = {"version": 1, "updated": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+           "note": "跨工具共享的 Agent 索引；只写本机验证过的事实。驾驶舱与 agenthub/AgentFind 共用。",
+           "agents": out}
+    CATALOG_PATH.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return doc
+
+
+def cmd_catalog(con, args):
+    if args.catalog_act == "build":
+        doc = catalog_build()
+        ins = [a["name"] for a in doc["agents"] if a["installed"]]
+        print(f"已写出 {CATALOG_PATH}")
+        print(f"目录收录 {len(doc['agents'])} 家；本机在装 {len(ins)} 家：{'、'.join(ins)}")
+        return
+    doc = json.loads(CATALOG_PATH.read_text(encoding="utf-8")) if CATALOG_PATH.exists() else None
+    if not doc:
+        print("还没有目录，先跑：agenthub catalog build")
+        return
+    for a in doc["agents"]:
+        q = (a.get("quota") or {}).get("status") or "—"
+        print(f"  {'●' if a['installed'] else '○'} {a['name']:<20}{a['vendor']:<10}"
+              f"记忆 {len(a['memory_synced']):>2} 条  余额[{q}]")
+        if args.detail and (a.get("quota") or {}).get("url"):
+            print(f"      {a['quota']['url']}")
+            print(f"      鉴权 {a['quota']['auth']}｜{a['quota']['evidence'][:70]}")
+    print(f"\n生成于 {doc['updated']}，文件：{CATALOG_PATH}")
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -858,6 +1027,13 @@ def main():
 
     ag = sub.add_parser("agents", help="列出可派工的子 Agent")
     ag.set_defaults(fn=cmd_agents)
+
+    ct = sub.add_parser("catalog", help="本机 Agent 索引目录：build / show")
+    cts = ct.add_subparsers(dest="catalog_act", required=True)
+    cts.add_parser("build", help="生成/刷新 ~/.agents/catalog.json（含在装判断）")
+    sh = cts.add_parser("show", help="列出目录里每家的记忆/余额接入状态")
+    sh.add_argument("--detail", action="store_true", help="连余额端点与鉴权方式一起打印")
+    ct.set_defaults(fn=cmd_catalog)
 
     ca = sub.add_parser("call", help="把任务派给子 Agent 无头执行")
     ca.add_argument("product", help="codex / claude")
