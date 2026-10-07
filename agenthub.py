@@ -984,31 +984,46 @@ def _dpapi(data):
     return res.raw
 
 
+def _aes_key(ls_path):
+    """Local State 里的 os_crypt.encrypted_key = base64("DPAPI" + DPAPI 包裹的 32B AES 主密钥)。"""
+    wrapped = base64.b64decode(json.loads(ls_path.read_text(encoding="utf-8"))["os_crypt"]["encrypted_key"])
+    if wrapped[:5] != b"DPAPI":
+        raise RuntimeError("encrypted_key 缺 DPAPI 前缀，格式变了")
+    return _dpapi(wrapped[5:])
+
+
+def _read_secret(con, aes, key):
+    row = con.execute("select value from ItemTable where key=?", (key,)).fetchone()
+    if not row:
+        return None
+    blob = bytes(json.loads(row[0])["data"])
+    if blob[:3] != b"v10":
+        return None
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    return json.loads(AESGCM(aes).decrypt(blob[3:15], blob[15:], None))
+
+
 def qoder_credit(appdata_name):
-    """返回 Qoder 自己写的 creditUsage 明文 dict；没装/没登录/缺依赖都给个说明性结果。"""
+    """返回 Qoder 自己写的 creditUsage 明文 + 登录身份；没装/没登录/缺依赖都给说明性结果。"""
     ad = Path(os.environ.get("APPDATA", "")) / appdata_name
     ls, db = ad / "Local State", ad / "User" / "globalStorage" / "state.vscdb"
     if not ls.is_file() or not db.is_file():
         return {"error": f"没找到 {appdata_name} 的 Local State 或 state.vscdb"}
     try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM   # noqa: F401 探测可选依赖
     except ImportError:
         return {"error": "缺 cryptography 库（pip install cryptography）"}
     try:
-        wrapped = base64.b64decode(json.loads(ls.read_text(encoding="utf-8"))["os_crypt"]["encrypted_key"])
-        key = _dpapi(wrapped[5:])                       # 前 5 字节是字面量 "DPAPI"
+        aes = _aes_key(ls)
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
-            row = con.execute("select value from ItemTable where key=?",
-                              ("secret://aicoding.auth.creditUsage",)).fetchone()
+            d = _read_secret(con, aes, "secret://aicoding.auth.creditUsage")
+            who = _read_secret(con, aes, "secret://aicoding.auth.userInfo")
         finally:
             con.close()
-        if not row:
-            return {"error": "库里没有 creditUsage（可能还没登录过）"}
-        blob = bytes(json.loads(row[0])["data"])
-        if blob[:3] != b"v10":
-            return {"error": f"不是 v10 格式（前缀 {blob[:3]!r}）"}
-        return {"data": json.loads(AESGCM(key).decrypt(blob[3:15], blob[15:], None))}
+        if d is None:
+            return {"error": "库里没有 creditUsage 或不是 v10 格式（可能还没登录过）"}
+        return {"data": d, "who": who}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -1049,11 +1064,16 @@ def cmd_quota(con, args):
             dump.append({"product": p, "error": r["error"]})
             continue
         d = r["data"]
+        who = r.get("who") or {}
+        acct = who.get("name") or (who.get("email") or "")[:24] or str(d.get("userId"))[:8] + "…"
+        if who.get("email") and who.get("name"):
+            acct += f"〈{who['email']}〉"
         buckets = credit_buckets(d)
         left = sum(b["remaining"] or 0 for b in buckets)
         total = sum(b["total"] or 0 for b in buckets)
-        rows.append((p, (d, buckets, left, total), None))
-        dump.append({"product": p, "userType": d.get("userType"), "left": left, "total": total,
+        rows.append((p, (d, buckets, left, total, acct), None))
+        dump.append({"product": p, "account": acct, "userId": d.get("userId"),
+                     "userType": d.get("userType"), "left": left, "total": total,
                      "expires": exp_text(d.get("expiresAt")), "exceeded": d.get("isQuotaExceeded"),
                      "buckets": buckets})
     if args.json:
@@ -1063,17 +1083,18 @@ def cmd_quota(con, args):
         if err:
             print(f"  {p:<12}读不到：{err}")
             continue
-        d, buckets, left, total = ok
+        d, buckets, left, total, acct = ok
         flag = "已超额" if d.get("isQuotaExceeded") else f"用了 {d.get('totalUsagePercentage', 0):.0%}"
-        print(f"  {p:<12}剩 {left}/{total} 积分 · {d.get('userType') or '?'} · 到期 {exp_text(d.get('expiresAt'))} · {flag}")
+        print(f"  {p:<12}剩 {left}/{total} 积分 · 账号 {acct} · {d.get('userType') or '?'} · "
+              f"到期 {exp_text(d.get('expiresAt'))} · {flag}")
         for b in buckets:
             print(f"      {b['pool']:<26}{b['used']}/{b['total']} → 剩 {b['remaining']} {b['unit']}")
     if args.write:
         for p, ok, _ in rows:
             if not ok:
                 continue
-            d, buckets, left, total = ok
-            line = (f"{p} 余额：剩 {left}/{total} 积分，到期 {exp_text(d.get('expiresAt'))}；"
+            d, buckets, left, total, acct = ok
+            line = (f"{p} 余额（账号 {acct}）：剩 {left}/{total} 积分，到期 {exp_text(d.get('expiresAt'))}；"
                     + "；".join(f"{b['pool']} 剩 {b['remaining']}/{b['total']}" for b in buckets))
             insert_note(con, "agenthub", "fact", f"{p} 余额快照", "quota,agenthub", line)
             print(f"  已写入共享记忆：{line[:60]}…")
